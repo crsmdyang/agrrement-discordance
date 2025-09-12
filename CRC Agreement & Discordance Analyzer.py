@@ -1,44 +1,39 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import itertools
 from io import BytesIO
-
-# --- Statistical Libraries ---
+import itertools
 import statsmodels.api as sm
 from statsmodels.stats.outliers_influence import variance_inflation_factor
-from statsmodels.stats.contingency_tables import mcnemar as sm_mcnemar
-from sklearn.metrics import roc_auc_score, confusion_matrix, roc_curve
-import pingouin as pg
-
-# --- Plotting Libraries ---
 import plotly.express as px
 import plotly.graph_objects as go
 
-# --- Reporting Libraries ---
-from pptx import Presentation
-from pptx.util import Inches
-from docx import Document
-from docx.shared import Inches
+# =========================
+# Page Configuration
+# =========================
+st.set_page_config(page_title="CRC 6‑Rater Agreement Analyzer", layout="wide")
+st.title("CRC 6‑Rater Agreement Analyzer")
+st.caption("6명의 평가자가 5점 척도로 평가한 ① AI vs MDT, ② AI vs Guideline, ③ MDT vs Guideline 의 일치도·신뢰도와 불일치 위험요인(다변량 로지스틱)을 자동 계산합니다.")
 
-# ---------------- App Configuration ----------------
-st.set_page_config(page_title="CRC Agreement & Discordance Analyzer — PLUS", layout="wide")
-st.title("CRC Agreement & Discordance Analyzer — PLUS")
-st.caption("5점 척도 일치도(κ/α/ICC) · 사용자 정의 가중행렬 · McNemar · AUC/정확도 · 자동 보고서(PPTX/DOCX/LaTeX)")
+# =========================
+# Utilities & Statistical Functions
+# =========================
 
-# ---------------- Utilities ----------------
 @st.cache_data
 def read_excel(file):
-    return pd.read_excel(file)
+    """Uploaded Excel 파일을 Pandas DataFrame으로 읽습니다."""
+    try:
+        return pd.read_excel(file)
+    except Exception as e:
+        st.error(f"엑셀 파일 읽기 오류: {e}")
+        return None
 
 def safe_num(s):
+    """문자열을 숫자형으로 안전하게 변환합니다. 변환 실패 시 NaT/NaN을 반환합니다."""
     return pd.to_numeric(s, errors="coerce")
 
-def categories_from_series(a, b=None):
-    vals = pd.concat([a.dropna(), b.dropna()]) if b is not None else a.dropna()
-    return sorted(pd.unique(vals))
-
-def make_distance_matrix(k, scheme="quadratic"):
+def make_distance_matrix(k: int, scheme: str = "quadratic") -> np.ndarray:
+    """가중 카파(Weighted Kappa) 계산을 위한 거리 행렬을 생성합니다."""
     idx = np.arange(k)
     D = np.zeros((k, k), dtype=float)
     for i in range(k):
@@ -47,442 +42,501 @@ def make_distance_matrix(k, scheme="quadratic"):
             if scheme == "linear":
                 D[i, j] = d
             elif scheme == "quadratic":
-                D[i, j] = d**2
-            elif scheme == "stepwise":
-                if d == 0: D[i, j] = 0.0
-                elif d <= 0.25: D[i, j] = 0.33
-                elif d <= 0.5: D[i, j] = 0.66
-                else: D[i, j] = 1.0
-            else: # unweighted (nominal)
+                D[i, j] = d ** 2
+            else: # nominal / unweighted
                 D[i, j] = 0.0 if i == j else 1.0
     return D
 
-def weighted_kappa_custom(a, b, labels, D):
-    cm = confusion_matrix(a, b, labels=labels)
+def weighted_kappa_custom(a: pd.Series, b: pd.Series, labels, D: np.ndarray) -> float:
+    """두 평가자 간의 가중 카파(Weighted Kappa)를 계산합니다."""
+    df = pd.DataFrame({"a": a, "b": b}).dropna()
+    if df.empty:
+        return np.nan
+    lab_to_i = {lab: i for i, lab in enumerate(labels)}
+    ai = df["a"].map(lab_to_i)
+    bi = df["b"].map(lab_to_i)
+    k = len(labels)
+    cm = np.zeros((k, k), dtype=float)
+    for i_, j_ in zip(ai, bi):
+        if pd.isna(i_) or pd.isna(j_):
+            continue
+        cm[int(i_), int(j_)] += 1
     n = cm.sum()
-    if n == 0: return np.nan
-    r, c = cm.sum(axis=1), cm.sum(axis=0)
+    if n == 0:
+        return np.nan
+    r = cm.sum(axis=1)
+    c = cm.sum(axis=0)
     Do = (D * cm).sum()
     E = np.outer(r, c) / n
     De = (D * E).sum()
-    return 1.0 - (Do / De) if De != 0 else np.nan
+    if De == 0:
+        return np.nan
+    return float(1.0 - Do / De)
 
-def bootstrap_ci_stat(fun, data_idx, B=2000, seed=42):
+def bootstrap_ci_stat(stat_fun, n_items: int, B: int = 2000, seed: int = 42):
+    """통계량의 부트스트랩 신뢰구간을 계산합니다."""
     rng = np.random.default_rng(seed)
-    stats = [fun(rng.choice(data_idx, len(data_idx), replace=True)) for _ in range(B)]
-    stats = [s for s in stats if pd.notna(s)]
-    if not stats: return np.nan, np.nan, np.nan, np.array([])
-    lo, hi = np.percentile(stats, [2.5, 97.5])
-    p = 2 * min((np.array(stats) <= 0).mean(), (np.array(stats) >= 0).mean())
-    return lo, hi, p, np.array(stats)
+    vals = []
+    for _ in range(B):
+        idx = rng.integers(0, n_items, n_items)
+        vals.append(stat_fun(idx))
+    vals = np.array(vals, dtype=float)
+    lo, hi = np.nanpercentile(vals, [2.5, 97.5])
+    p_boot = 2 * min((vals <= 0).mean(), (vals >= 0).mean())
+    return float(lo), float(hi), float(p_boot), vals
 
-def fleiss_kappa(ratings_df, B=2000, seed=42):
-    X = ratings_df.copy()
-    categories = sorted(pd.unique(X.values.ravel()))
-    categories = [c for c in categories if pd.notna(c)]
-    cat_to_idx = {c: i for i, c in enumerate(categories)}
+def fleiss_kappa(ratings_df: pd.DataFrame, B: int = 2000, seed: int = 42):
+    """다수 평가자 간의 Fleiss' Kappa를 계산합니다 (비가중치)."""
+    X = ratings_df.copy().dropna()
+    if X.empty:
+        return np.nan, np.nan, np.nan, np.array([])
+    
+    cats = sorted(pd.unique(X.values.ravel()))
+    m = len(cats)
+    cat_to_i = {c: i for i, c in enumerate(cats)}
     n_items, n_raters = X.shape
-    n_cats = len(categories)
-
-    def _calc_kappa(df):
-        N = np.zeros((df.shape[0], n_cats), dtype=int)
-        for u, (_, row) in enumerate(df.iterrows()):
-            counts = row.value_counts(dropna=True)
-            for c, cnt in counts.items():
-                if c in cat_to_idx:
-                    N[u, cat_to_idx[c]] = cnt
-        
-        n_raters_per_item = N.sum(axis=1)
-        valid_items_mask = n_raters_per_item > 1
-        if not np.any(valid_items_mask): return np.nan
-
-        P_u = ((N[valid_items_mask] * (N[valid_items_mask] - 1)).sum(axis=1)) / (n_raters_per_item[valid_items_mask] * (n_raters_per_item[valid_items_mask] - 1))
-        P_bar = P_u.mean()
-        p_j = N.sum(axis=0) / N.sum()
-        P_e = (p_j**2).sum()
-        return (P_bar - P_e) / (1 - P_e) if (1 - P_e) != 0 else np.nan
     
-    kappa = _calc_kappa(X)
-    rng = np.random.default_rng(seed)
-    boots = [_calc_kappa(X.iloc[rng.integers(0, n_items, n_items)]) for _ in range(B)]
-    boots = [k for k in boots if pd.notna(k)]
-    lo, hi = np.nanpercentile(boots, [2.5, 97.5]) if boots else (np.nan, np.nan)
-    return float(kappa), float(lo), float(hi), np.array(boots)
+    if n_raters < 2: return np.nan, np.nan, np.nan, np.array([])
 
-def krippendorff_alpha(ratings_df, level="ordinal", B=2000, seed=42):
-    def _calc_alpha(df):
-        X = df.copy().to_numpy()
-        cats = sorted([c for c in pd.unique(X.ravel()) if pd.notna(c)])
-        cat_to_idx = {c: i for i, c in enumerate(cats)}
-        m = len(cats)
-        if m < 2: return np.nan
-        
+    N = np.zeros((n_items, m), dtype=float)
+    for u in range(n_items):
+        vc = pd.Series(X.iloc[u, :]).value_counts()
+        for c, cnt in vc.items():
+            if c in cat_to_i:
+                N[u, cat_to_i[c]] = cnt
+    
+    Pu = ((N * (N - 1)).sum(axis=1)) / (n_raters * (n_raters - 1))
+    P_bar = np.nanmean(Pu)
+    pj = N.sum(axis=0) / (n_items * n_raters)
+    Pe = (pj ** 2).sum()
+    kappa = (P_bar - Pe) / (1 - Pe) if (1 - Pe) != 0 else np.nan
+
+    # Bootstrap
+    rng = np.random.default_rng(seed)
+    boots = []
+    for _ in range(B):
+        idx = rng.integers(0, n_items, n_items)
+        Nb = N[idx, :]
+        Pub = ((Nb * (Nb - 1)).sum(axis=1)) / (n_raters * (n_raters - 1))
+        P_bar_b = np.nanmean(Pub)
+        pjb = Nb.sum(axis=0) / (n_items * n_raters)
+        Peb = (pjb ** 2).sum()
+        kb = (P_bar_b - Peb) / (1 - Peb) if (1 - Peb) != 0 else np.nan
+        boots.append(kb)
+    
+    boots = np.array(boots, dtype=float)
+    lo, hi = np.nanpercentile(boots, [2.5, 97.5])
+    return float(kappa), float(lo), float(hi), boots
+
+def krippendorff_alpha(ratings_df: pd.DataFrame, B: int = 2000, seed: int = 42):
+    """다수 평가자 간의 Krippendorff's Alpha를 계산합니다 (서열척도)."""
+    X = ratings_df.copy()
+    cats = sorted(pd.unique(X.values.ravel()))
+    cats = [c for c in cats if pd.notna(c)]
+    if not cats: return np.nan, np.nan, np.nan, np.array([])
+    
+    cat_to_i = {c: i for i, c in enumerate(cats)}
+    m = len(cats)
+
+    def calculate_alpha(df):
         O = np.zeros((m, m), dtype=float)
-        for row in X:
-            vals = [v for v in row if pd.notna(v)]
+        for _, row in df.iterrows():
+            vals = [v for v in row.values if pd.notna(v)]
             if len(vals) < 2: continue
-            counts = pd.Series(vals).value_counts()
-            for i, ci in counts.items():
-                i_idx = cat_to_idx[i]
-                for j, cj in counts.items():
-                    j_idx = cat_to_idx[j]
-                    O[i_idx, j_idx] += ci * cj if i != j else ci * (ci - 1)
+            vc = pd.Series(vals).value_counts()
+            for i_c, ci in vc.items():
+                ii = cat_to_i[i_c]
+                O[ii, ii] += ci * (ci - 1)
+                for j_c, cj in vc.items():
+                    if j_c != i_c:
+                        jj = cat_to_i[j_c]
+                        O[ii, jj] += ci * cj
         
-        N = O.sum()
-        if N == 0: return np.nan
+        if O.sum() == 0: return np.nan
         
-        D = np.array([[abs(i - j) for j in range(m)] for i in range(m)])
-        if level == "nominal": D = (D > 0).astype(float)
-        else: D = (D / (m-1))**2 if m > 1 else np.zeros_like(D)
+        D = np.zeros((m, m), dtype=float)
+        for i in range(m):
+            for j in range(m):
+                d = abs(i - j) / (m - 1) if m > 1 else 0.0
+                D[i, j] = d ** 2
         
-        Do = (O * D).sum() / N
-        n_i = O.sum(axis=1) + np.diag(O) # Total count for each category
-        E = np.outer(n_i, n_i) - np.diag(n_i)
-        De = (E * D).sum() / (N * (N-1) / O.shape[0]) if N > 1 else 0
-        
-        return 1.0 - Do / De if De > 0 else np.nan
+        Do = (O * D).sum() / O.sum()
+        n_i = O.sum(axis=1)
+        E = np.outer(n_i, n_i)
+        for i in range(m):
+            E[i, i] = n_i[i] * (n_i[i] - 1)
+        if E.sum() == 0: return np.nan
+        De = (E * D).sum() / E.sum()
+        if De == 0: return np.nan
+        return 1.0 - Do / De
 
-    alpha = _calc_alpha(ratings_df)
-    n_items = len(ratings_df)
+    alpha = calculate_alpha(X)
+    
+    # Bootstrap
     rng = np.random.default_rng(seed)
-    boots = [_calc_alpha(ratings_df.iloc[rng.integers(0, n_items, n_items)]) for _ in range(B)]
-    boots = [a for a in boots if pd.notna(a)]
-    lo, hi = np.nanpercentile(boots, [2.5, 97.5]) if boots else (np.nan, np.nan)
-    return float(alpha), float(lo), float(hi), np.array(boots)
-
-def percent_exact(a, b):
-    v = ~(a.isna() | b.isna())
-    return float((a[v] == b[v]).mean()) if v.sum() > 0 else np.nan
-
-def interpret_kappa(k):
-    if pd.isna(k): return "N/A"
-    if k < 0: return "Poor"
-    if k <= 0.2: return "Slight"
-    if k <= 0.4: return "Fair"
-    if k <= 0.6: return "Moderate"
-    if k <= 0.8: return "Substantial"
-    return "Almost Perfect"
-
-def pair_summary(df, a_col, b_col, labels, D):
-    a = df[a_col]; b = df[b_col]
-    cm = confusion_matrix(a, b, labels=labels)
-    pea = percent_exact(a, b) * 100.0
-    k = weighted_kappa_custom(a, b, labels, D)
+    n_items = len(X)
+    boots = [calculate_alpha(X.iloc[rng.integers(0, n_items, n_items)]) for _ in range(B)]
+    boots = np.array(boots, dtype=float)
+    lo, hi = np.nanpercentile(boots, [2.5, 97.5])
     
-    def stat_fun(idx):
-        return weighted_kappa_custom(a.iloc[idx], b.iloc[idx], labels, D)
-    lo, hi, p_boot, boots = bootstrap_ci_stat(stat_fun, df.index, B=int(st.session_state.B), seed=int(st.session_state.seed))
-    
-    summ = pd.DataFrame({
-        "Metric": ["Percent Exact (%)", "Weighted Kappa", "Interpretation", "95% CI (lower)", "95% CI (upper)", "p-value (bootstrap)"],
-        "Value": [f"{pea:.2f}", f"{k:.4f}", interpret_kappa(k), f"{lo:.4f}", f"{hi:.4f}", f"{p_boot:.4f}"]
-    })
-    cm_df = pd.DataFrame(cm, index=[f"A={x}" for x in labels], columns=[f"B={x}" for x in labels])
-    return summ, cm_df, boots
+    return float(alpha), float(lo), float(hi), boots
 
-def fit_logit(df, y_col, x_cols, robust=True):
+def pairwise_kappa_table(raters_df: pd.DataFrame, labels, D: np.ndarray, B: int = 2000, seed: int = 42):
+    """모든 평가자 쌍에 대한 가중 카파 테이블을 생성합니다."""
+    rows = []
+    n = len(raters_df)
+    if n == 0: return pd.DataFrame()
+    
+    for a, b in itertools.combinations(raters_df.columns, 2):
+        def stat_fun(idx):
+            return weighted_kappa_custom(raters_df[a].iloc[idx], raters_df[b].iloc[idx], labels, D)
+        k0 = stat_fun(np.arange(n))
+        lo, hi, p_boot, _ = bootstrap_ci_stat(stat_fun, n, B=B, seed=seed)
+        pea = float((raters_df[a] == raters_df[b]).mean()) * 100.0
+        rows.append({
+            "Rater A": a, "Rater B": b,
+            "Exact Agreement (%)": f"{pea:.2f}",
+            "Weighted Kappa": f"{k0:.4f}",
+            "95% CI Lower": f"{lo:.4f}",
+            "95% CI Upper": f"{hi:.4f}",
+            "P-value (Boot)": f"{p_boot:.4f}"
+        })
+    return pd.DataFrame(rows)
+
+def lights_kappa(raters_df: pd.DataFrame, labels, D: np.ndarray, B: int = 2000, seed: int = 42):
+    """Light's Kappa (모든 쌍별 카파의 평균)를 계산합니다."""
+    pairs = list(itertools.combinations(raters_df.columns, 2))
+    n = len(raters_df)
+    if n == 0: return np.nan, np.nan, np.nan, np.array([])
+
+    def lk_from_idx(idx):
+        vals = [weighted_kappa_custom(raters_df[a].iloc[idx], raters_df[b].iloc[idx], labels, D) for a, b in pairs]
+        return float(np.nanmean(vals))
+    
+    k0 = lk_from_idx(np.arange(n))
+    lo, hi, _, boots = bootstrap_ci_stat(lk_from_idx, n, B=B, seed=seed)
+    return float(k0), float(lo), float(hi), boots
+
+def fit_logit(df: pd.DataFrame, y_col: str, x_cols, robust=True):
+    """로지스틱 회귀 모델을 적합하고 결과를 반환합니다."""
     X = df[x_cols].copy()
     cat_cols = [c for c in x_cols if (not pd.api.types.is_numeric_dtype(X[c])) or X[c].nunique() <= 6]
-    X = pd.get_dummies(X, columns=cat_cols, drop_first=True, dummy_na=False).astype(float)
-    X = X.dropna()
+    X = pd.get_dummies(X, columns=cat_cols, drop_first=True, dtype=float)
+    X = X.replace([np.inf, -np.inf], np.nan).dropna()
     y = df.loc[X.index, y_col].astype(int)
     
-    if len(y.unique()) < 2:
-        raise ValueError("Outcome variable must have at least two unique values.")
-        
+    if len(X) < len(x_cols) + 1:
+        raise ValueError("샘플 수가 변수 수보다 적어 모델을 실행할 수 없습니다.")
+    if y.nunique() < 2:
+        raise ValueError("종속변수(불일치 여부)에 두 가지 이상의 범주가 존재해야 합니다.")
+
     X = sm.add_constant(X, has_constant="add")
     model = sm.Logit(y, X)
     res = model.fit(disp=False, maxiter=200)
-    if robust: res = res.get_robustcov_results(cov_type="HC3")
-
+    if robust:
+        res = res.get_robustcov_results(cov_type="HC3")
+    
     params = res.params
     conf = res.conf_int()
-    or_tab = pd.DataFrame({
+    out = pd.DataFrame({
         "Variable": params.index,
-        "OR": np.exp(params), "CI_lower": np.exp(conf[0]), "CI_upper": np.exp(conf[1]),
-        "p-value": res.pvalues
+        "OR": np.exp(params),
+        "CI Lower": np.exp(conf.iloc[:, 0]),
+        "CI Upper": np.exp(conf.iloc[:, 1]),
+        "P-value": res.pvalues
     }).round(4)
-    or_tab = or_tab[or_tab["Variable"] != "const"].reset_index(drop=True)
-
-    vif_df = pd.DataFrame()
+    out = out[out["Variable"] != "const"].reset_index(drop=True)
+    
+    # VIF
+    vif_rows = []
     Xv = X.drop(columns=["const"], errors="ignore")
     if Xv.shape[1] >= 2:
-        vif_df = pd.DataFrame({
-            "Variable": Xv.columns,
-            "VIF": [variance_inflation_factor(Xv.values, i) for i in range(Xv.shape[1])]
-        })
-    return res, or_tab, vif_df
+        for i in range(Xv.shape[1]):
+            vif_rows.append({"Variable": Xv.columns[i], "VIF": variance_inflation_factor(Xv.values, i)})
+    vif_df = pd.DataFrame(vif_rows)
+    
+    return res, out, vif_df
 
-# ---------------- Sidebar ----------------
+def infer_labels(raters_df: pd.DataFrame):
+    """평가 데이터에서 고유한 라벨(척도)을 추론합니다."""
+    vals = pd.unique(raters_df.values.ravel())
+    vals = sorted([v for v in vals if pd.notna(v)])
+    return vals if vals else [1, 2, 3, 4, 5]
+
+# =========================
+# Sidebar – Upload & Settings
+# =========================
 with st.sidebar:
     st.header("1) 파일 업로드 & 설정")
-    up = st.file_uploader("Excel (.xlsx)", type=["xlsx"])
-    st.session_state["B"] = st.number_input("Bootstrap 반복횟수", value=2000, min_value=200, step=200, help="신뢰구간 계산을 위한 시뮬레이션 횟수입니다.")
-    st.session_state["seed"] = st.number_input("Random Seed", value=42, min_value=0, step=1, help="결과의 재현성을 위한 시드값입니다.")
-    st.caption("필수 컬럼: case_id, AI, MDT, Guideline, S1..S6")
+    up = st.file_uploader(
+        "Excel (.xlsx)", type=["xlsx"],
+        help="Wide 형식의 엑셀 파일을 업로드하세요. 각 비교쌍(AI-MDT 등)마다 6명의 평가자 점수가 포함된 열이 있어야 합니다."
+    )
+    
+    if st.button("샘플 템플릿(.xlsx) 다운로드"):
+        n = 300; np.random.seed(0)
+        def r5(n): return np.random.choice([1,2,3,4,5], size=n, p=[0.1,0.2,0.4,0.2,0.1])
+        df_tmp = pd.DataFrame({
+            "case_id": [f"C{str(i+1).zfill(3)}" for i in range(n)],
+            "A_M_S1": r5(n), "A_M_S2": r5(n), "A_M_S3": r5(n), "A_M_S4": r5(n), "A_M_S5": r5(n), "A_M_S6": r5(n),
+            "A_G_S1": r5(n), "A_G_S2": r5(n), "A_G_S3": r5(n), "A_G_S4": r5(n), "A_G_S5": r5(n), "A_G_S6": r5(n),
+            "M_G_S1": r5(n), "M_G_S2": r5(n), "M_G_S3": r5(n), "M_G_S4": r5(n), "M_G_S5": r5(n), "M_G_S6": r5(n),
+            "age": np.random.normal(65, 10, n).round().astype(int), "sex": np.random.choice(["M","F"], size=n),
+            "ASA": np.random.choice([1,2,3,4], size=n, p=[0.1,0.4,0.4,0.1]), "ECOG": np.random.choice([0,1,2,3], size=n, p=[0.3,0.4,0.2,0.1]),
+            "T": np.random.choice(["T1","T2","T3","T4"], size=n, p=[0.1,0.2,0.5,0.2]), "N": np.random.choice(["N0","N1","N2"], size=n, p=[0.5,0.3,0.2]),
+            "stage": np.random.choice(["I","II","III","IV"], size=n, p=[0.1,0.4,0.4,0.1]), "PNI": np.random.choice([0,1], size=n, p=[0.7,0.3]),
+            "EMVI": np.random.choice([0,1], size=n, p=[0.7,0.3]), "obstruction": np.random.choice([0,1], size=n, p=[0.7,0.3])
+        })
+        bio = BytesIO()
+        with pd.ExcelWriter(bio, engine="openpyxl") as w:
+            df_tmp.to_excel(w, index=False, sheet_name="data")
+        bio.seek(0)
+        st.download_button("sample_template.xlsx 다운로드", data=bio, file_name="sample_template.xlsx", key="download_template")
+
+    st.divider()
+    st.header("2) 분석 설정")
+    B = st.number_input(
+        "Bootstrap 반복 횟수", value=2000, min_value=100, step=100,
+        help="신뢰구간 추정을 위한 시뮬레이션 횟수입니다. 높을수록 안정적이지만 계산 시간이 길어집니다."
+    )
+    seed = st.number_input(
+        "Random Seed", value=42, min_value=0, step=1,
+        help="분석의 재현성을 위한 난수 시드입니다. 같은 시드를 사용하면 항상 동일한 결과가 나옵니다."
+    )
+    scheme = st.selectbox(
+        "가중 방식 (Kappa)", options=["quadratic", "linear", "unweighted"], index=0,
+        help="가중 카파 계산 시 불일치에 대한 페널티 방식입니다. Quadratic은 차이가 클수록 페널티를 더 크게 부여합니다."
+    )
+    
+    st.divider()
+    if st.button("모든 설정 및 데이터 초기화", type="secondary"):
+        st.session_state.clear()
+        st.rerun()
 
 if up is None:
-    st.info("분석할 엑셀 파일을 업로드하세요. (예시: sample_template.xlsx)")
+    st.info("👈 사이드바에서 엑셀 파일을 업로드하거나 샘플 템플릿을 다운로드하여 시작하세요.")
     st.stop()
 
+# =========================
+# Main Panel Logic
+# =========================
 df = read_excel(up)
-st.success(f"데이터 로드 완료: {df.shape[0]} 행 × {df.shape[1]} 열")
+if df is None: st.stop()
 
-# ---------------- Column Mapping ----------------
-with st.expander("컬럼 매핑 및 선택", expanded=True):
+if 'df_shape' not in st.session_state or st.session_state.df_shape != df.shape:
+    st.session_state.clear()
+    st.session_state.df_shape = df.shape
+
+st.success(f"파일 로드 완료: {df.shape[0]} 행 × {df.shape[1]} 열")
+
+# --- Column mapping ---
+with st.expander("STEP 1: 분석할 열 선택 (각 비교쌍별 평가자 6명)", expanded=True):
     cols = df.columns.tolist()
-    case_id_col = st.selectbox("Case ID", options=cols, index=cols.index("case_id") if "case_id" in cols else 0)
-    ai_col = st.selectbox("AI", options=cols, index=cols.index("AI") if "AI" in cols else 1)
-    mdt_col = st.selectbox("MDT", options=cols, index=cols.index("MDT") if "MDT" in cols else 2)
-    gdl_col = st.selectbox("Guideline", options=cols, index=cols.index("Guideline") if "Guideline" in cols else 3)
-    default_surgeons = [c for c in ["S1", "S2", "S3", "S4", "S5", "S6"] if c in cols]
-    surgeon_cols = st.multiselect("Surgeon columns (6명)", options=cols, default=default_surgeons)
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.session_state.case_id_col = st.selectbox("환자 ID 열", options=cols, 
+            index=cols.index("case_id") if "case_id" in cols else 0, key="case_id_select")
+    
+    st.markdown("---")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.markdown("**AI vs MDT**")
+        st.session_state.am_cols = st.multiselect("평가자 6명 선택", options=cols, 
+            default=[c for c in cols if c.startswith("A_M_S")][:6], key="am_cols_select")
+    with c2:
+        st.markdown("**AI vs Guideline**")
+        st.session_state.ag_cols = st.multiselect("평가자 6명 선택 ", options=cols, 
+            default=[c for c in cols if c.startswith("A_G_S")][:6], key="ag_cols_select")
+    with c3:
+        st.markdown("**MDT vs Guideline**")
+        st.session_state.mg_cols = st.multiselect("평가자 6명 선택  ", options=cols, 
+            default=[c for c in cols if c.startswith("M_G_S")][:6], key="mg_cols_select")
 
-for c in list(set([ai_col, mdt_col, gdl_col] + surgeon_cols)):
-    if c in df.columns:
-        df[c] = safe_num(df[c])
+# Coerce selected columns to numeric
+for col_group in [st.session_state.am_cols, st.session_state.ag_cols, st.session_state.mg_cols]:
+    for c in col_group:
+        if c in df.columns:
+            df[c] = safe_num(df[c])
 
-# ---------------- Tabs ----------------
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-    "👨‍⚕️ 평가자 간 신뢰도 (6 Surgeons)", "🤖 AI vs MDT", "📖 AI vs Guideline",
-    "🧑‍🤝‍🧑 MDT vs Guideline", "🔍 불일치 위험요인 분석", "📊 McNemar & AUC/정확도"
-])
+# --- Analysis Tabs ---
+pair_tabs = st.tabs(["AI vs MDT", "AI vs Guideline", "MDT vs Guideline", "불일치 위험요인 분석"])
 
-# ---------------- Tab 1: Inter-rater ----------------
-with tab1:
-    st.subheader("6인 다자간 일치도 분석")
-    if len(surgeon_cols) < 2:
-        st.warning("최소 2명 이상의 Surgeon 컬럼을 선택하세요.")
+def render_pair_block(name: str, cols: list[str]):
+    st.subheader(f"📊 {name} — 6인 평가 일치도/신뢰도 분석")
+    if len(cols) != 6:
+        st.warning("👈 위에서 평가자 6명의 열을 선택해주세요.")
+        return {}, {}
+    
+    R = df[cols].copy().dropna()
+    if R.empty:
+        st.error("선택한 열에 유효한 데이터가 없습니다. 데이터나 열 선택을 확인하세요.")
+        return {}, {}
+
+    labels = infer_labels(R)
+    D = make_distance_matrix(len(labels), scheme)
+
+    # Metrics calculation
+    try:
+        pair_tab = pairwise_kappa_table(R, labels, D, B=B, seed=seed)
+        lk, llo, lhi, _ = lights_kappa(R, labels, D, B=B, seed=seed)
+        fk, fk_lo, fk_hi, _ = fleiss_kappa(R, B=B, seed=seed)
+        ka, ka_lo, ka_hi, _ = krippendorff_alpha(R, B=B, seed=seed)
+    except Exception as e:
+        st.error(f"통계 계산 중 오류 발생: {e}")
+        return {}, {}
+
+    # Display results
+    c1, c2 = st.columns(2)
+    with c1:
+        st.info("쌍별 가중 Kappa (Weighted Kappa)", icon="ℹ️")
+        st.caption("모든 평가자 쌍(15개)에 대해 가중 카파를 계산합니다. 1에 가까울수록 일치도가 높습니다.")
+        st.dataframe(pair_tab, use_container_width=True)
+        
+        st.info("종합 신뢰도 지표", icon="ℹ️")
+        st.caption("Light's Kappa: 모든 쌍별 가중 카파의 평균입니다.\nFleiss' Kappa: 다수 평가자 간 일치도 (비가중치).\nKrippendorff's Alpha: 유연성이 높은 다수 평가자 신뢰도 지표 (서열척도 적용).")
+        summary_df = pd.DataFrame([
+            {"Metric": "Light's Kappa (weighted)", "Value": f"{lk:.4f}", "95% CI": f"({llo:.4f} - {lhi:.4f})"},
+            {"Metric": "Fleiss' Kappa (unweighted)", "Value": f"{fk:.4f}", "95% CI": f"({fk_lo:.4f} - {fk_hi:.4f})"},
+            {"Metric": "Krippendorff's Alpha (ordinal)", "Value": f"{ka:.4f}", "95% CI": f"({ka_lo:.4f} - {ka_hi:.4f})"},
+        ]).set_index("Metric")
+        st.dataframe(summary_df, use_container_width=True)
+
+    with c2:
+        st.info("합의 점수(Consensus Score) 분포", icon="ℹ️")
+        st.caption("각 케이스별 6인 평가의 중앙값(median)을 합의 점수로 정의하고, 그 분포를 보여줍니다.")
+        consensus = R.median(axis=1, skipna=True)
+        fig = px.histogram(consensus, nbins=len(labels)*2, title=f"<b>{name}: 합의 점수 분포</b>")
+        fig.update_layout(showlegend=False, yaxis_title="케이스 수", xaxis_title="합의 점수 (중앙값)")
+        st.plotly_chart(fig, use_container_width=True)
+
+    # Return tables for report export
+    out_tables = {
+        f"{name}_pairwise_kappa": pair_tab,
+        f"{name}_summary_reliability": summary_df.reset_index()
+    }
+    return out_tables, {"consensus": consensus}
+
+with pair_tabs[0]:
+    st.session_state.tables_am, st.session_state.meta_am = render_pair_block("AI_vs_MDT", st.session_state.am_cols)
+with pair_tabs[1]:
+    st.session_state.tables_ag, st.session_state.meta_ag = render_pair_block("AI_vs_Guideline", st.session_state.ag_cols)
+with pair_tabs[2]:
+    st.session_state.tables_mg, st.session_state.meta_mg = render_pair_block("MDT_vs_Guideline", st.session_state.mg_cols)
+
+# --- Risk factors Tab ---
+with pair_tabs[3]:
+    st.subheader("⚡️ 불일치 위험요인 분석 (다변량 로지스틱 회귀분석)")
+    
+    meta_map = {
+        "AI_vs_MDT": st.session_state.get('meta_am', {}), 
+        "AI_vs_Guideline": st.session_state.get('meta_ag', {}), 
+        "MDT_vs_Guideline": st.session_state.get('meta_mg', {})
+    }
+
+    c1, c2 = st.columns(2)
+    with c1:
+        pair = st.selectbox(
+            "분석할 비교쌍", ["AI_vs_MDT", "AI_vs_Guideline", "MDT_vs_Guideline"], key="logit_pair",
+            help="어떤 비교쌍의 불일치에 대한 위험요인을 분석할지 선택합니다."
+        )
+    with c2:
+        thr = st.number_input(
+            "불일치(Discordance) 정의 임계값", value=2, min_value=1, max_value=5, step=1,
+            help="합의 점수(중앙값)가 이 값 '이하'일 경우를 불일치(1)로 정의합니다."
+        )
+
+    if 'consensus' not in meta_map[pair]:
+        st.warning(f"먼저 '{pair}' 탭에서 일치도 분석을 실행하여 합의 점수를 계산해야 합니다.")
         st.stop()
     
-    raters_df = df[surgeon_cols].dropna()
-    st.info(f"결측값을 제외한 {len(raters_df)}개의 케이스로 분석을 수행합니다.")
+    df["_discordant"] = (meta_map[pair]['consensus'] <= thr).astype(int)
+    
+    st.info(f"'{pair}' 비교쌍에서 합의 점수가 **{thr} 이하**인 경우를 '불일치'로 정의했습니다. (총 {df['_discordant'].sum()} / {len(df['_discordant'])} 케이스)")
 
-    if not raters_df.empty:
-        c1, c2 = st.columns(2)
+    excluded = set([st.session_state.case_id_col] + st.session_state.am_cols + st.session_state.ag_cols + st.session_state.mg_cols + ["_discordant"])
+    candidates = [c for c in df.columns if c not in excluded]
+    default_covars = [c for c in candidates if c in ["age", "sex", "ASA", "ECOG", "stage", "T", "N", "PNI", "EMVI", "obstruction"]]
+    
+    covars = st.multiselect(
+        "분석에 포함할 공변량(독립변수)", options=candidates, default=default_covars, key="logit_covars",
+        help="불일치에 영향을 줄 것으로 예상되는 변수들을 선택합니다."
+    )
+    robust = st.checkbox("Robust Standard Errors (HC3) 사용", value=True, help="이상치(outlier) 등에 덜 민감한 강건한 표준오차를 사용하여 p-value를 계산합니다.")
+
+    if st.button("위험요인 분석 실행", type="primary", use_container_width=True) and covars:
+        try:
+            res, or_tab, vif_df = fit_logit(df, "_discordant", covars, robust=robust)
+            st.session_state.or_tab = or_tab
+            st.session_state.vif_df = vif_df
+            st.session_state.logit_summary = res.summary2().as_text()
+        except Exception as e:
+            st.error(f"로지스틱 회귀분석 오류: {e}")
+            st.session_state.or_tab = None
+
+    if 'or_tab' in st.session_state and st.session_state.or_tab is not None:
+        st.markdown("---")
+        st.subheader("분석 결과")
+        
+        c1, c2 = st.columns([0.6, 0.4])
         with c1:
-            st.markdown("**Fleiss' Kappa (unweighted)**")
-            with st.spinner("Fleiss' Kappa 계산 중..."):
-                try:
-                    kf, kf_lo, kf_hi, kf_boots = fleiss_kappa(raters_df, B=int(st.session_state.B), seed=int(st.session_state.seed))
-                    st.dataframe(pd.DataFrame({
-                        "Metric": ["Fleiss' Kappa", "Interpretation", "95% CI (lower)", "95% CI (upper)"],
-                        "Value": [f"{kf:.4f}", interpret_kappa(kf), f"{kf_lo:.4f}", f"{kf_hi:.4f}"]
-                    }), use_container_width=True)
-                except Exception as e:
-                    st.error(f"Fleiss' Kappa 계산 오류: {e}")
-            
-            st.markdown("**Krippendorff's Alpha**")
-            level = st.radio("측정 수준", options=["ordinal", "nominal"], horizontal=True, key="kripp_level")
-            with st.spinner(f"Krippendorff's Alpha ({level}) 계산 중..."):
-                try:
-                    ka, ka_lo, ka_hi, ka_boots = krippendorff_alpha(raters_df, level=level, B=int(st.session_state.B), seed=int(st.session_state.seed))
-                    st.dataframe(pd.DataFrame({
-                        "Metric": [f"Krippendorff's Alpha ({level})", "Interpretation", "95% CI (lower)", "95% CI (upper)"],
-                        "Value": [f"{ka:.4f}", interpret_kappa(ka), f"{ka_lo:.4f}", f"{ka_hi:.4f}"]
-                    }), use_container_width=True)
-                except Exception as e:
-                    st.error(f"Krippendorff's Alpha 계산 오류: {e}")
-            
-            st.markdown("**Intra-class Correlation Coefficient (ICC)**")
-            with st.spinner("ICC 계산 중..."):
-                try:
-                    # Prepare data for pingouin ICC
-                    icc_df = raters_df.copy()
-                    icc_df['case_id'] = icc_df.index
-                    icc_df = icc_df.melt(id_vars='case_id', value_vars=surgeon_cols, var_name='rater', value_name='rating')
-                    
-                    icc = pg.intraclass_corr(data=icc_df, targets='case_id', raters='rater', ratings='rating').set_index('Type')
-                    icc3 = icc.loc['ICC3']
-                    st.dataframe(pd.DataFrame({
-                        "Metric": ["ICC (Two-way random, Absolute agreement)", "95% CI"],
-                        "Value": [f"{icc3['ICC']:.4f}", f"[{icc3['CI95%'][0]:.4f}, {icc3['CI95%'][1]:.4f}]"]
-                    }), use_container_width=True)
-                except Exception as e:
-                    st.error(f"ICC 계산 오류: {e}")
+            st.info("Odds Ratio (OR) Plot", icon="📈")
+            st.caption("OR이 1보다 크면 불일치 위험을 높이는 요인, 1보다 작으면 낮추는 요인입니다. 신뢰구간(에러바)이 1을 포함하면 통계적으로 유의하지 않을 수 있습니다.")
+            fig = px.scatter(st.session_state.or_tab, x="OR", y="Variable", error_x="CI Upper", error_x_minus="CI Lower",
+                             log_x=True, labels={"Variable":""}, title="<b>불일치 위험요인 Odds Ratios</b>")
+            fig.add_vline(x=1, line_dash="dash", line_color="grey")
+            fig.update_yaxes(autorange="reversed")
+            st.plotly_chart(fig, use_container_width=True)
 
         with c2:
-            st.markdown("**신뢰도 계수 분포 (Bootstrap)**")
-            if 'kf_boots' in locals() and kf_boots.any():
-                fig = px.histogram(kf_boots, nbins=50, title="Fleiss' Kappa Bootstrap 분포", labels={'value':"Kappa"})
-                fig.add_vline(x=kf, line_dash="dash", line_color="red", annotation_text="Kappa")
-                fig.add_vline(x=kf_lo, line_dash="dot", line_color="green", annotation_text="CI 2.5%")
-                fig.add_vline(x=kf_hi, line_dash="dot", line_color="green", annotation_text="CI 97.5%")
-                st.plotly_chart(fig, use_container_width=True)
-            if 'ka_boots' in locals() and ka_boots.any():
-                fig = px.histogram(ka_boots, nbins=50, title=f"Krippendorff's Alpha ({level}) Bootstrap 분포", labels={'value':"Alpha"})
-                fig.add_vline(x=ka, line_dash="dash", line_color="red", annotation_text="Alpha")
-                fig.add_vline(x=ka_lo, line_dash="dot", line_color="green", annotation_text="CI 2.5%")
-                fig.add_vline(x=ka_hi, line_dash="dot", line_color="green", annotation_text="CI 97.5%")
-                st.plotly_chart(fig, use_container_width=True)
-
-# ---------------- Pairwise helper UI ----------------
-def pairwise_block(title, A, B, key_prefix):
-    st.subheader(title)
-    a, b = df[A], df[B]
-    labels = categories_from_series(a, b)
-
-    scheme = st.selectbox(f"{title} — 가중 방식", options=["quadratic", "linear", "unweighted", "stepwise", "custom CSV"], key=f"scheme_{key_prefix}")
-    
-    if scheme == "custom CSV":
-        st.info("k×k 거리 행렬 CSV 업로드 (대각선=0, 값∈[0,1])\n카테고리 순서: " + ", ".join(map(str, labels)))
-        up_csv = st.file_uploader("거리 행렬 CSV", type=["csv"], key=f"csv_{key_prefix}")
-        if up_csv:
-            try:
-                D = pd.read_csv(up_csv, header=None).values.astype(float)
-                if D.shape != (len(labels), len(labels)):
-                    st.error(f"행렬 크기가 {D.shape}가 아닌 ({len(labels)}, {len(labels)})여야 합니다.")
-                    return {}
-                if (np.diag(D) != 0).any() or (D < 0).any() or (D > 1).any():
-                    st.error("대각선은 0, 모든 원소는 [0,1] 범위여야 합니다.")
-                    return {}
-            except Exception as e:
-                st.error(f"CSV 파싱 오류: {e}")
-                return {}
-        else:
-            return {}
-    else:
-        D = make_distance_matrix(len(labels), scheme=scheme if scheme != "unweighted" else "nominal")
-
-    with st.spinner(f"{title} 일치도 분석 중..."):
-        try:
-            summ, cm_df, boots = pair_summary(df, A, B, labels, D)
-            c1, c2 = st.columns(2)
-            with c1:
-                st.markdown("**일치도 요약**")
-                st.dataframe(summ, use_container_width=True)
-            with c2:
-                st.markdown("**교차분석표 (Confusion Matrix)**")
-                fig = px.imshow(cm_df, text_auto=True, color_continuous_scale='Blues',
-                                title="교차분석표 히트맵", labels=dict(x=f"B: {B}", y=f"A: {A}", color="Count"))
-                st.plotly_chart(fig, use_container_width=True)
-            return {"summary": summ, "cm": cm_df}
-        except Exception as e:
-            st.error(f"계산 오류: {e}")
-    return {}
-
-with tab2:
-    pairwise_block("AI vs MDT", ai_col, mdt_col, "ai_mdt")
-with tab3:
-    pairwise_block("AI vs Guideline", ai_col, gdl_col, "ai_gdl")
-with tab4:
-    pairwise_block("MDT vs Guideline", mdt_col, gdl_col, "mdt_gdl")
-
-# ---------------- Tab 5: Risk factors ----------------
-with tab5:
-    st.subheader("불일치 위험요인 분석 (로지스틱 회귀)")
-    pair = st.selectbox("관심 쌍", ["AI vs MDT", "AI vs Guideline", "MDT vs Guideline"])
-    thr = st.number_input("불일치 임계값 |A−B| ≥", value=1, min_value=1, max_value=5, step=1)
-    
-    a_col_risk, b_col_risk = (ai_col, mdt_col) if pair == "AI vs MDT" else ((ai_col, gdl_col) if pair == "AI vs Guideline" else (mdt_col, gdl_col))
-    df["_discordant"] = (df[a_col_risk] - df[b_col_risk]).abs() >= thr
-    
-    cand = [c for c in df.columns if c not in [case_id_col, ai_col, mdt_col, gdl_col, "_discordant"] + surgeon_cols]
-    default_covars = [c for c in ["age", "sex", "ASA", "ECOG", "stage", "T", "N", "PNI", "EMVI", "obstruction"] if c in cand]
-    covars = st.multiselect("공변량 선택", options=cand, default=default_covars)
-    robust = st.checkbox("Robust Standard Errors (HC3)", value=True)
-
-    if st.button("회귀분석 실행", type="primary"):
-        if covars:
-            with st.spinner("로지스틱 회귀분석 모델 학습 중..."):
-                try:
-                    res, or_tab, vif_df = fit_logit(df, "_discordant", covars, robust=robust)
-                    st.markdown("**Odds Ratios (불일치 발생)**")
-                    
-                    # Odds Ratio Plot
-                    fig = px.scatter(or_tab, x="OR", y="Variable", error_x="CI_upper", error_x_minus="CI_lower",
-                                     log_x=True, title="Odds Ratio Plot (log scale)")
-                    fig.update_traces(error_x=dict(symmetric=False, array=or_tab['CI_upper'] - or_tab['OR'], arrayminus=or_tab['OR'] - or_tab['CI_lower']))
-                    fig.add_vline(x=1, line_dash="dash", line_color="grey")
-                    st.plotly_chart(fig, use_container_width=True)
-                    st.dataframe(or_tab, use_container_width=True)
-
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        st.markdown("**VIF (분산팽창지수)**")
-                        st.dataframe(vif_df.sort_values("VIF", ascending=False), use_container_width=True)
-                    with c2:
-                        st.markdown("**모델 요약**")
-                        st.text(res.summary())
-
-                except ValueError as e:
-                    st.error(f"모델 오류: {e}")
-                except Exception as e:
-                    st.error(f"모델링 중 알 수 없는 오류 발생: {e}")
-
-# ---------------- Tab 6: McNemar & AUC/Accuracy ----------------
-with tab6:
-    st.subheader("McNemar 검정 및 AUC/정확도 비교")
-    left, right = st.columns(2)
-
-    with left:
-        st.markdown("**McNemar 검정 (짝지은 2x2)**")
-        mcn_pair = st.selectbox("비교쌍 (이진화 필요)", ["AI vs MDT", "AI vs Guideline", "MDT vs Guideline"], key="mcn_pair")
-        tA = st.number_input("A 양성 임계(≥)", value=4, min_value=1, max_value=5, step=1, key="tA")
-        tB = st.number_input("B 양성 임계(≥)", value=4, min_value=1, max_value=5, step=1, key="tB")
-        
-        a_col_mcn, b_col_mcn = (ai_col, mdt_col) if mcn_pair == "AI vs MDT" else ((ai_col, gdl_col) if mcn_pair == "AI vs Guideline" else (mdt_col, gdl_col))
-        a_bin = (df[a_col_mcn] >= tA)
-        b_bin = (df[b_col_mcn] >= tB)
-        
-        valid_idx = ~(a_bin.isna() | b_bin.isna())
-        tab = pd.crosstab(a_bin[valid_idx], b_bin[valid_idx])
-        st.dataframe(tab, use_container_width=True)
-
-        if tab.shape == (2, 2):
-            try:
-                res = sm_mcnemar(tab, exact=True)
-                st.metric("McNemar p-value (exact)", f"{res.pvalue:.4f}")
-            except Exception as e:
-                st.error(f"McNemar 계산 오류: {e}")
-        else:
-            st.warning("데이터가 2x2 테이블을 형성하지 않습니다. 임계값을 조정하세요.")
-
-    with right:
-        st.markdown("**AUC/정확도 vs 기준(Reference)**")
-        ref_col = st.selectbox("기준 열", options=[gdl_col, mdt_col, ai_col], index=0)
-        ref_binary = st.checkbox("기준 이진화 (≥ 임계)", value=True)
-        tRef = st.number_input("기준 임계(≥)", value=4, min_value=1, max_value=5, step=1, disabled=not ref_binary)
-
-        y_true = (df[ref_col] >= tRef).astype(float) if ref_binary else pd.to_numeric(df[ref_col], errors="coerce")
-        y_true.dropna(inplace=True)
-        if y_true.nunique() != 2:
-            st.warning("기준(Reference)이 이진(binary) 데이터가 아닙니다. AUC 계산이 부정확할 수 있습니다.")
-        
-        pred_cols = st.multiselect("예측 열 (성능 비교)", options=[c for c in [ai_col, mdt_col] if c!=ref_col], default=[c for c in [ai_col, mdt_col] if c!=ref_col])
-        cutoff = st.number_input("분류 임계 (예측 ≥)", value=4, min_value=1, max_value=5, step=1)
-        
-        if pred_cols and not y_true.empty:
-            rows = []
-            fig_roc = go.Figure()
-            fig_roc.add_shape(type='line', line=dict(dash='dash'), x0=0, x1=1, y0=0, y1=1)
-
-            for pcol in pred_cols:
-                score = pd.to_numeric(df.loc[y_true.index, pcol], errors='coerce').dropna()
-                common_idx = y_true.index.intersection(score.index)
-                
-                if common_idx.empty: continue
-
-                y_true_common, score_common = y_true.loc[common_idx], score.loc[common_idx]
-                
-                try:
-                    auc = roc_auc_score(y_true_common, score_common)
-                    fpr, tpr, _ = roc_curve(y_true_common, score_common)
-                    fig_roc.add_trace(go.Scatter(x=fpr, y=tpr, name=f'{pcol} (AUC={auc:.3f})', mode='lines'))
-                except Exception:
-                    auc = np.nan
-
-                y_pred_bin = (df.loc[common_idx, pcol] >= cutoff)
-                acc = (y_true_common == y_pred_bin).mean()
-                rows.append({"Predictor": pcol, "AUC": f"{auc:.4f}", "Accuracy": f"{acc:.4f}"})
+            st.info("Odds Ratio (OR) Table", icon="📋")
+            st.dataframe(st.session_state.or_tab.style.format(precision=4), use_container_width=True)
             
-            st.dataframe(pd.DataFrame(rows), use_container_width=True)
-            fig_roc.update_layout(xaxis_title='1 - Specificity', yaxis_title='Sensitivity', title='ROC Curves')
-            st.plotly_chart(fig_roc, use_container_width=True)
+            st.info("다중공선성 (VIF)", icon="⚠️")
+            st.caption("VIF(분산팽창요인)는 독립변수 간 상관관계를 나타냅니다. 보통 10을 초과하면 다중공선성을 의심할 수 있습니다.")
+            st.dataframe(st.session_state.vif_df.sort_values("VIF", ascending=False).style.format({"VIF": "{:.2f}"}), use_container_width=True)
+        
+        with st.expander("전체 모델 요약 보기 (Statsmodels)"):
+            st.text(st.session_state.logit_summary)
 
+
+# =========================
+# Export Results
+# =========================
 st.divider()
-st.subheader("보고서 자동 생성")
-st.info("현재 화면의 설정을 기반으로 보고서가 생성됩니다.")
+st.subheader("📥 결과 다운로드 (Excel)")
 
-# The report generation functions are omitted for brevity, but are the same as the original script.
-# This is to focus on the core logic and new features. The user can copy them from the original script if needed.
+def build_results_workbook():
+    tables = {}
+    if 'tables_am' in st.session_state: tables.update(st.session_state.tables_am or {})
+    if 'tables_ag' in st.session_state: tables.update(st.session_state.tables_ag or {})
+    if 'tables_mg' in st.session_state: tables.update(st.session_state.tables_mg or {})
+    if 'or_tab' in st.session_state and st.session_state.or_tab is not None:
+        tables[f"RiskFactors_{st.session_state.logit_pair}"] = st.session_state.or_tab
+        tables[f"VIF_{st.session_state.logit_pair}"] = st.session_state.vif_df
+
+    if not tables:
+        st.warning("다운로드할 분석 결과가 없습니다. 먼저 분석을 실행해주세요.")
+        return None
+
+    bio = BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        for name, table_df in tables.items():
+            if isinstance(table_df, pd.DataFrame) and not table_df.empty:
+                table_df.to_excel(writer, sheet_name=name[:31], index=False)
+    bio.seek(0)
+    return bio
+
+try:
+    xls_data = build_results_workbook()
+    if xls_data:
+        st.download_button(
+            label="통합 분석 결과 (results.xlsx) 다운로드",
+            data=xls_data,
+            file_name="CRC_Agreement_Analysis_Results.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
+        )
+except Exception as e:
+    st.error(f"결과 파일 생성 중 오류 발생: {e}")
+
+st.caption("© 2025 — CRC 6‑Rater Agreement Analyzer (Enhanced by Gemini)")
