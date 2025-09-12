@@ -287,8 +287,14 @@ with st.sidebar:
         st.download_button("sample_template.xlsx 다운로드", data=bio, file_name="sample_template.xlsx", key="download_template")
 
     st.divider(); st.header("2) 분석 설정")
-    B = st.number_input("Bootstrap 반복 횟수", 2000, 100, 100, help="신뢰구간 추정 시뮬레이션 횟수. 높을수록 안정적이지만 계산 시간이 길어집니다.")
-    seed = st.number_input("Random Seed", 42, 0, 1, help="분석 재현성을 위한 난수 시드. 같은 시드를 사용하면 항상 동일한 결과가 나옵니다.")
+    B = st.number_input(
+        "Bootstrap 반복 횟수", 
+        min_value=100, 
+        value=2000, 
+        step=100, 
+        help="신뢰구간 추정 시뮬레이션 횟수. 높을수록 안정적이지만 계산 시간이 길어집니다."
+    )
+    seed = st.number_input("Random Seed", value=42, min_value=0, step=1, help="분석 재현성을 위한 난수 시드. 같은 시드를 사용하면 항상 동일한 결과가 나옵니다.")
     scheme = st.selectbox("가중 방식 (Kappa)", ["quadratic","linear","unweighted"], 0, help="가중 카파 계산 시 불일치에 대한 페널티 방식입니다. Quadratic은 차이가 클수록 페널티를 더 크게 부여합니다.")
     st.divider()
     if st.button("모든 설정 및 데이터 초기화", type="secondary"): st.session_state.clear(); st.rerun()
@@ -329,7 +335,7 @@ def render_pair_block(name: str, cols: list[str]):
     if len(cols) != 6: st.warning("👈 위에서 평가자 6명의 열을 선택해주세요."); return {}, {}
     
     R = df[cols].copy()
-    if R.dropna().empty: st.error("선택한 열에 유효한 데이터가 없습니다."); return {}, {}
+    if R.dropna(how='all').empty: st.error("선택한 열에 유효한 데이터가 없습니다."); return {}, {}
     
     labels, D = infer_labels(R), make_distance_matrix(len(infer_labels(R)), scheme)
     try:
@@ -362,6 +368,14 @@ def render_pair_block(name: str, cols: list[str]):
         fig = px.histogram(consensus.dropna(), nbins=len(labels)*2, title=f"<b>{name}: 합의 점수 분포</b>")
         fig.update_layout(showlegend=False, yaxis_title="케이스 수", xaxis_title="합의 점수 (중앙값)")
         st.plotly_chart(fig, use_container_width=True)
+        
+        st.info("전체 평점 분포", icon="ℹ️")
+        st.caption("모든 평가자와 케이스에 걸쳐 각 점수가 몇 번씩 부여되었는지 보여줍니다.")
+        ratings_long = R.melt(var_name='rater', value_name='rating').dropna()
+        fig2 = px.histogram(ratings_long, x='rating', title=f"<b>{name}: 전체 평점 분포</b>", category_orders={"rating": labels})
+        fig2.update_layout(yaxis_title="빈도 수", xaxis_title="평점")
+        st.plotly_chart(fig2, use_container_width=True)
+
 
     with st.expander("케이스별 불일치 분석 보기 (Top 10)"):
         st.caption("각 케이스에 대한 6명 평가의 표준편차(StDev)를 계산하여 불일치가 가장 큰 상위 10개 케이스를 보여줍니다.")
