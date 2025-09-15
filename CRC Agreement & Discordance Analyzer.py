@@ -4,15 +4,23 @@ import numpy as np
 from io import BytesIO
 import itertools, json, os
 import statsmodels.api as sm
-from statsmodels.stats.outliers_influence import variance_inflation_factor
 from statsmodels.stats.contingency_tables import mcnemar as sm_mcnemar
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, roc_curve
 from scipy import stats
+from zipfile import ZipFile, ZIP_DEFLATED
+
+# --- VIF: 견고한 임포트(없으면 경고만) ---
+try:
+    from statsmodels.stats.outliers_influence import variance_inflation_factor  # <- 정확한 경로
+    HAS_VIF = True
+except Exception:
+    variance_inflation_factor = None
+    HAS_VIF = False
 
 # optional deps
 try:
     import plotly.express as px
-    import plotly.figure_factory as ff
+    import plotly.graph_objects as go
     HAS_PLOTLY = True
 except Exception:
     HAS_PLOTLY = False
@@ -22,8 +30,33 @@ try:
 except Exception:
     HAS_PINGOUIN = False
 
+# ---------------- App meta ----------------
 st.set_page_config(page_title="CRC Agreement Analyzer — MAX", layout="wide")
 st.title("CRC Agreement Analyzer — MAX (Everything-in-One)")
+
+# ---------------- Session-safe stores ----------------
+for k, default in [
+    ("results_tables", {}),
+    ("consensus_map", {}),
+    ("images_store", {}),
+]:
+    if k not in st.session_state:
+        st.session_state[k] = default
+
+# ---------------- Glossary (간단 정의) ----------------
+GLOSSARY = {
+    "Light's κ (weighted mean)": "여러 평가자 쌍의 가중 Cohen κ 평균(가중체계 선택).",
+    "Fleiss' κ (unweighted)": "다수 평가자의 범주 일치도(모든 쌍을 한꺼번에).",
+    "Krippendorff's α (ordinal)": "서열/명목/간격 등급에 맞춘 일반화 일치도.",
+    "ICC(2,k)": "평가자 간 일치도(혼합효과·절대합치·평균측정).",
+    "Brennan–Prediger κ": "우도에 덜 민감한 κ(기대합치=1/k).",
+    "PABAK (multi)": "관찰합치(Po) 기반의 보정 κ(=2·Po−1).",
+    "McNemar": "두 이진 분류의 불일치(01 vs 10) 비교 검정.",
+    "AUC": "ROC 곡선 아래 면적(임계치 불변의 순위 기반 성능).",
+    "DeLong": "두 AUC 차이의 비모수 추정/검정.",
+    "Firth logistic": "희귀사건/완전분리 보정 로지스틱 회귀.",
+    "VIF": "공선성 지표(>5~10이면 다중공선성 의심).",
+}
 
 # ---------------- Utilities ----------------
 @st.cache_data
@@ -88,6 +121,15 @@ def bootstrap_ci_stat(fun, n, B=2000, seed=42):
     lo, hi = np.nanpercentile(vals, [2.5,97.5])
     p = 2*min((vals<=0).mean(), (vals>=0).mean())
     return float(lo), float(hi), float(p), vals
+
+def bootstrap_multi_stat(df, stat_func, B=2000, seed=42):
+    n = len(df)
+    if n == 0: return np.nan, np.nan, np.array([])
+    rng = np.random.default_rng(seed)
+    vals = [stat_func(df.iloc[rng.integers(0, n, n)]) for _ in range(B)]
+    vals = np.array(vals, dtype=float)
+    lo, hi = np.nanpercentile(vals, [2.5, 97.5])
+    return float(lo), float(hi), vals
 
 def fleiss_kappa(ratings_df, B=2000, seed=42):
     X=ratings_df.copy()
@@ -155,21 +197,18 @@ def krippendorff_alpha(ratings_df, level="ordinal", B=2000, seed=42):
     return float(a0), float(lo), float(hi), np.array(boots)
 
 def observed_exact_agreement_multi(raters_df):
-    # multi-rater exact agreement among unordered pairs
     agree_pairs=0.0; total_pairs=0.0
     for _, row in raters_df.iterrows():
         vals = pd.Series(row).dropna().values
         n = len(vals)
         if n<2: continue
         total_pairs += n*(n-1)/2.0
-        # counts per category
         vc = pd.Series(vals).value_counts()
         agree_pairs += sum(c*(c-1)/2.0 for c in vc.values)
     return (agree_pairs/total_pairs) if total_pairs>0 else np.nan
 
 def brennan_prediger_kappa(raters_df):
     Po = observed_exact_agreement_multi(raters_df)
-    # categories across all ratings
     cats = sorted([c for c in pd.unique(raters_df.values.ravel()) if pd.notna(c)])
     k = max(1, len(cats))
     return ((Po - 1.0/k) / (1.0 - 1.0/k)) if k>1 and pd.notna(Po) else np.nan
@@ -191,16 +230,15 @@ def pairwise_kappa_table(raters_df, labels, D, B=2000, seed=42):
                      "Weighted Kappa":round(k0,4),"95% CI Lower":round(lo,4),
                      "95% CI Upper":round(hi,4),"P (bootstrap)":round(p,6),
                      "Interp": interpret_kappa(k0)})
-    # Holm correction for multiple testing
+    # Holm 보정
     m=len(pvals)
     if m>0:
         order=np.argsort(pvals)
         adj=[None]*m; maxv=0
         for rank, idx in enumerate(order):
-            padj = pvals[idx]*(m-rank)
-            padj = min(1.0, padj)
+            padj = min(1.0, pvals[idx]*(m-rank))
             maxv = max(maxv, padj)
-            adj[idx]=maxv  # step-down monotone
+            adj[idx]=maxv
         for i,row in enumerate(rows): row["P Holm"] = round(adj[i],6)
     return pd.DataFrame(rows)
 
@@ -238,7 +276,7 @@ def bootstrap_metric_ci(y_true, y_score, metric_fun, B=2000, seed=42):
     lo,hi = np.nanpercentile(vals, [2.5,97.5])
     return float(lo), float(hi), np.array(vals)
 
-# DeLong helpers
+# --- DeLong helpers ---
 def _compute_midrank(x):
     J = np.argsort(x); Z = x[J]; N = len(x); T = np.zeros(N, dtype=float); i=0
     while i<N:
@@ -275,7 +313,7 @@ def delong_compare(y_true, s1, s2):
     p = 2*(1 - stats.norm.cdf(abs(z))) if np.isfinite(z) else np.nan
     return float(auc1), float(auc2), float(z), float(p)
 
-# Firth logistic (bias-reduced)
+# --- Firth logistic (bias-reduced) ---
 def firth_logit(X, y, max_iter=200, tol=1e-8):
     X = np.asarray(X, float); y = np.asarray(y, int)
     n,p = X.shape
@@ -302,6 +340,7 @@ def firth_logit(X, y, max_iter=200, tol=1e-8):
 
 def fit_logit(df, y_col, x_cols, robust=True, penalty=None, alpha=1.0, stepwise=False, firth=False):
     X = df[x_cols].copy()
+    # 범주형 자동 더미화(범주개수<=6도 더미)
     cat_cols=[c for c in x_cols if (not pd.api.types.is_numeric_dtype(X[c])) or X[c].nunique()<=6]
     X=pd.get_dummies(X, columns=cat_cols, drop_first=True, dtype=float)
     y=df[y_col].astype(int)
@@ -322,8 +361,12 @@ def fit_logit(df, y_col, x_cols, robust=True, penalty=None, alpha=1.0, stepwise=
                             "CI Upper":np.exp(params + 1.96*se_s),
                             "P-value":pvals}).round(4)
         out = out[out["Variable"]!="const"].reset_index(drop=True)
-        Xv = X.drop(columns=["const"], errors="ignore")
-        vif_rows = [{"Variable": Xv.columns[i], "VIF": variance_inflation_factor(Xv.values, i)} for i in range(Xv.shape[1])] if Xv.shape[1]>=2 else []
+        # VIF
+        if HAS_VIF and X.shape[1]>1:
+            Xv = X.drop(columns=["const"], errors="ignore")
+            vif_rows = [{"Variable": Xv.columns[i], "VIF": variance_inflation_factor(Xv.values, i)} for i in range(Xv.shape[1])] if Xv.shape[1]>=2 else []
+        else:
+            vif_rows = []
         class Res: pass
         res = Res(); res.params=params; res.cov_params=lambda: cov; res.pvalues=pd.Series(pvals, index=params.index)
         res.summary2=lambda: type("S",(),{"as_text":lambda self: "Firth logistic (approx Wald CIs)"})()
@@ -347,8 +390,12 @@ def fit_logit(df, y_col, x_cols, robust=True, penalty=None, alpha=1.0, stepwise=
         out = pd.DataFrame({"Variable":res.params.index, "OR":np.exp(res.params),
                             "CI Lower":np.exp(conf[0]), "CI Upper":np.exp(conf[1]), "P-value":res.pvalues}).round(4)
         out = out[out["Variable"]!="const"].reset_index(drop=True)
-        Xv = X[["const"]+current].drop(columns=["const"], errors="ignore")
-        vif_rows = [{"Variable": Xv.columns[i], "VIF": variance_inflation_factor(Xv.values, i)} for i in range(Xv.shape[1])] if Xv.shape[1]>=2 else []
+        # VIF
+        if HAS_VIF:
+            Xv = (X[["const"]+current]).drop(columns=["const"], errors="ignore")
+            vif_rows = [{"Variable": Xv.columns[i], "VIF": variance_inflation_factor(Xv.values, i)} for i in range(Xv.shape[1])] if Xv.shape[1]>=2 else []
+        else:
+            vif_rows = []
         return res, out, pd.DataFrame(vif_rows)
     if penalty in ("l2","l1"):
         l1_wt=0.0 if penalty=="l2" else 1.0
@@ -356,8 +403,11 @@ def fit_logit(df, y_col, x_cols, robust=True, penalty=None, alpha=1.0, stepwise=
         params=m.params
         out=pd.DataFrame({"Variable":params.index, "OR":np.exp(params)}).round(4)
         out=out[out["Variable"]!="const"].reset_index(drop=True)
-        Xv=X.drop(columns=["const"], errors="ignore")
-        vif_rows=[{"Variable":Xv.columns[i], "VIF":variance_inflation_factor(Xv.values,i)} for i in range(Xv.shape[1])] if Xv.shape[1]>=2 else []
+        if HAS_VIF:
+            Xv=X.drop(columns=["const"], errors="ignore")
+            vif_rows=[{"Variable":Xv.columns[i], "VIF":variance_inflation_factor(Xv.values,i)} for i in range(Xv.shape[1])] if Xv.shape[1]>=2 else []
+        else:
+            vif_rows=[]
         return m, out, pd.DataFrame(vif_rows)
     model = sm.Logit(y, X).fit(disp=False, maxiter=200)
     res = model.get_robustcov_results(cov_type="HC3") if robust else model
@@ -365,8 +415,11 @@ def fit_logit(df, y_col, x_cols, robust=True, penalty=None, alpha=1.0, stepwise=
     out = pd.DataFrame({"Variable":res.params.index, "OR":np.exp(res.params),
                         "CI Lower":np.exp(conf[0]), "CI Upper":np.exp(conf[1]), "P-value":res.pvalues}).round(4)
     out = out[out["Variable"]!="const"].reset_index(drop=True)
-    Xv = X.drop(columns=["const"], errors="ignore")
-    vif_rows = [{"Variable": Xv.columns[i], "VIF": variance_inflation_factor(Xv.values, i)} for i in range(Xv.shape[1])] if Xv.shape[1]>=2 else []
+    if HAS_VIF:
+        Xv = X.drop(columns=["const"], errors="ignore")
+        vif_rows = [{"Variable": Xv.columns[i], "VIF": variance_inflation_factor(Xv.values, i)} for i in range(Xv.shape[1])] if Xv.shape[1]>=2 else []
+    else:
+        vif_rows=[]
     return res, out, pd.DataFrame(vif_rows)
 
 def infer_labels(raters_df):
@@ -375,7 +428,6 @@ def infer_labels(raters_df):
 
 def per_rater_stats(raters_df, labels, D):
     raters = list(raters_df.columns)
-    # mean weighted kappa per rater
     means=[]
     for r in raters:
         ks=[]
@@ -400,6 +452,24 @@ def kappa_heatmap(raters_df, labels, D, title):
     fig.update_layout(coloraxis_colorbar=dict(title="κ"), xaxis_title="", yaxis_title="")
     return fig, K, raters
 
+def plot_roc_curves(y_true, scores_dict, auc_dict):
+    fig = go.Figure()
+    fig.add_shape(type='line', line=dict(dash='dash'), x0=0, x1=1, y0=0, y1=1)
+    for name, score in scores_dict.items():
+        idx = y_true.dropna().index.intersection(score.dropna().index)
+        yt = y_true.loc[idx]; ys = score.loc[idx]
+        if len(idx)==0: continue
+        fpr, tpr, _ = roc_curve(yt, ys)
+        auc_val = auc_dict.get(name, np.nan)
+        fig.add_trace(go.Scatter(x=fpr, y=tpr, name=f"{name} (AUC={auc_val:.3f})", mode='lines'))
+    fig.update_layout(
+        xaxis_title='1 - Specificity',
+        yaxis_title='Sensitivity',
+        title='ROC Curve Comparison',
+        legend=dict(x=0.5, y=0.1, xanchor='center', yanchor='bottom')
+    )
+    return fig
+
 def summarize_pair(name, raters_df, weight_scheme, custom_D, B, seed, kripp_level="ordinal"):
     labels = infer_labels(raters_df)
     D = custom_D if custom_D is not None else make_distance_matrix(len(labels), weight_scheme)
@@ -408,16 +478,21 @@ def summarize_pair(name, raters_df, weight_scheme, custom_D, B, seed, kripp_leve
     fk, fk_lo, fk_hi, _ = fleiss_kappa(raters_df, B=B, seed=seed) if raters_df.shape[1]>=2 else (np.nan,np.nan,np.nan,np.array([]))
     ka, ka_lo, ka_hi, _ = krippendorff_alpha(raters_df, level=kripp_level, B=B, seed=seed)
     icc, icc_lo, icc_hi = calculate_icc(raters_df)
+    # 보수적: BP/PABAK에도 부트스트랩 CI
     bp = brennan_prediger_kappa(raters_df)
+    bp_lo, bp_hi, _ = bootstrap_multi_stat(raters_df, brennan_prediger_kappa, B=B, seed=seed)
     pb = pabak_multi(raters_df)
+    pb_lo, pb_hi, _ = bootstrap_multi_stat(raters_df, pabak_multi, B=B, seed=seed)
+
     summary = pd.DataFrame([
-        {"Metric":"Light's κ (weighted mean)","Value":lk,"CI_lo":llo,"CI_hi":lhi,"Interp":interpret_kappa(lk)},
-        {"Metric":"Fleiss' κ (unweighted)","Value":fk,"CI_lo":fk_lo,"CI_hi":fk_hi,"Interp":interpret_kappa(fk)},
-        {"Metric":"Krippendorff's α ("+kripp_level+")","Value":ka,"CI_lo":ka_lo,"CI_hi":ka_hi,"Interp":interpret_kappa(ka)},
-        {"Metric":"ICC(2,k)","Value":icc,"CI_lo":icc_lo,"CI_hi":icc_hi,"Interp":interpret_kappa(icc)},
-        {"Metric":"Brennan–Prediger κ","Value":bp,"CI_lo":np.nan,"CI_hi":np.nan,"Interp":interpret_kappa(bp)},
-        {"Metric":"PABAK (multi)","Value":pb,"CI_lo":np.nan,"CI_hi":np.nan,"Interp":interpret_kappa(pb)},
+        {"Metric":"Light's κ (weighted mean)","Value":lk,"CI_lo":llo,"CI_hi":lhi,"Interp":interpret_kappa(lk),"Definition":GLOSSARY["Light's κ (weighted mean)"]},
+        {"Metric":"Fleiss' κ (unweighted)","Value":fk,"CI_lo":fk_lo,"CI_hi":fk_hi,"Interp":interpret_kappa(fk),"Definition":GLOSSARY["Fleiss' κ (unweighted)"]},
+        {"Metric":f"Krippendorff's α ({kripp_level})","Value":ka,"CI_lo":ka_lo,"CI_hi":ka_hi,"Interp":interpret_kappa(ka),"Definition":GLOSSARY["Krippendorff's α (ordinal)"]},
+        {"Metric":"ICC(2,k)","Value":icc,"CI_lo":icc_lo,"CI_hi":icc_hi,"Interp":interpret_kappa(icc),"Definition":GLOSSARY["ICC(2,k)"]},
+        {"Metric":"Brennan–Prediger κ","Value":bp,"CI_lo":bp_lo,"CI_hi":bp_hi,"Interp":interpret_kappa(bp),"Definition":GLOSSARY["Brennan–Prediger κ"]},
+        {"Metric":"PABAK (multi)","Value":pb,"CI_lo":pb_lo,"CI_hi":pb_hi,"Interp":interpret_kappa(pb),"Definition":GLOSSARY["PABAK (multi)"]},
     ]).round(4)
+
     consensus = raters_df.median(axis=1, skipna=True)
     rat_stats = per_rater_stats(raters_df, labels, D)
     return pair_tab, summary, consensus, labels, D, rat_stats
@@ -425,74 +500,80 @@ def summarize_pair(name, raters_df, weight_scheme, custom_D, B, seed, kripp_leve
 # ---------------- Sidebar ----------------
 with st.sidebar:
     st.header("1) 파일 업로드")
-    up = st.file_uploader("Excel (.xlsx)", type=["xlsx"])
-    if st.button("샘플 템플릿(.xlsx) 다운로드"):
+    up = st.file_uploader("Excel (.xlsx)", type=["xlsx"], key="uploader_main")
+    if st.button("샘플 템플릿(.xlsx) 다운로드", key="btn_sample"):
         bio=BytesIO(); st.session_state["_dummy"]=0
-        import numpy as np
         np.random.seed(0); n=300
         def r5(n): return np.random.choice([1,2,3,4,5], size=n, p=[.1,.2,.4,.2,.1])
-        raters=8
+        raters=6
         cols={}
         for pair in ["A_M","A_G","M_G"]:
-            for r in range(1, raters+1): cols[f"{pair}_R{r}"]=r5(n)
-        df=pd.DataFrame({"case_id":[f"C{str(i+1).zfill(3)}" for i in range(n)], **cols,
-                         "AI_label": r5(n), "MDT_label": r5(n), "GL_label": r5(n),
-                         "age":np.random.normal(65,10,n).round().astype(int),
-                         "sex":np.random.choice(["M","F"],n),
-                         "ASA":np.random.choice([1,2,3,4],n,p=[.1,.4,.4,.1]),
-                         "ECOG":np.random.choice([0,1,2,3],n,p=[.3,.4,.2,.1]),
-                         "T":np.random.choice(["T1","T2","T3","T4"],n,p=[.1,.2,.5,.2]),
-                         "N":np.random.choice(["N0","N1","N2"],n,p=[.5,.3,.2]),
-                         "stage":np.random.choice(["I","II","III","IV"],n,p=[.1,.4,.4,.1]),
-                         "PNI":np.random.choice([0,1],n,p=[.7,.3]),
-                         "EMVI":np.random.choice([0,1],n,p=[.7,.3]),
-                         "obstruction":np.random.choice([0,1],n,p=[.7,.3])})
-        with pd.ExcelWriter(bio, engine="openpyxl") as w: df.to_excel(w, index=False)
+            for r in range(1, raters+1): cols[f"{pair}_S{r}"]=r5(n)
+        df_tmp=pd.DataFrame({"case_id":[f"C{str(i+1).zfill(3)}" for i in range(n)], **cols,
+                             "AI_label": r5(n), "MDT_label": r5(n), "GL_label": r5(n),
+                             "age":np.random.normal(65,10,n).round().astype(int),
+                             "sex":np.random.choice(["M","F"],n),
+                             "ASA":np.random.choice([1,2,3,4],n,p=[.1,.4,.4,.1]),
+                             "ECOG":np.random.choice([0,1,2,3],n,p=[.3,.4,.2,.1]),
+                             "T":np.random.choice(["T1","T2","T3","T4"],n,p=[.1,.2,.5,.2]),
+                             "N":np.random.choice(["N0","N1","N2"],n,p=[.5,.3,.2]),
+                             "stage":np.random.choice(["I","II","III","IV"],n,p=[.1,.4,.4,.1]),
+                             "PNI":np.random.choice([0,1],n,p=[.7,.3]),
+                             "EMVI":np.random.choice([0,1],n,p=[.7,.3]),
+                             "obstruction":np.random.choice([0,1],n,p=[.7,.3])})
+        with pd.ExcelWriter(bio, engine="openpyxl") as w: df_tmp.to_excel(w, index=False)
         bio.seek(0)
-        st.download_button("sample_template.xlsx 저장", data=bio, file_name="sample_template.xlsx")
+        st.download_button("sample_template.xlsx 저장", data=bio, file_name="sample_template.xlsx", key="dl_sample")
 
     st.divider()
     st.header("2) 분석 설정")
-    B = st.number_input("Bootstrap resamples", value=2000, min_value=200, step=200)
-    seed = st.number_input("Random seed", value=42, min_value=0, step=1)
-    weight_scheme = st.selectbox("가중 방식 (κ)", ["quadratic","linear","stepwise","unweighted","custom CSV"])
+    B = st.number_input("Bootstrap resamples", value=2000, min_value=200, step=200, key="num_B", help="부트스트랩 반복 수(클수록 신뢰구간 안정).")
+    seed = st.number_input("Random seed", value=42, min_value=0, step=1, key="num_seed", help="재현성을 위한 난수 시드.")
+    weight_scheme = st.selectbox("가중 방식 (κ)", ["quadratic","linear","stepwise","unweighted","custom CSV"], key="sel_weight",
+                                 help="가중 Cohen κ에서 범주 간 거리 함수 선택.")
     custom_D = None
     if weight_scheme == "custom CSV":
         up_csv = st.file_uploader("가중 거리행렬 CSV 업로드 (k×k, 대각=0, [0,1])", type=["csv"], key="W_csv")
     else:
         up_csv = None
-    kripp_level = st.selectbox("Krippendorff's α 등급", ["ordinal","nominal"], index=0)
+    kripp_level = st.selectbox("Krippendorff's α 등급", ["ordinal","nominal"], index=0, key="sel_alpha_level",
+                               help="α 거리: ordinal=서열(제곱거리), nominal=명목(0/1).")
     st.divider()
     st.header("3) 포함할 분석/옵션")
-    do_icc = st.checkbox("ICC 포함", value=True)
-    do_fleiss = st.checkbox("Fleiss' κ 포함", value=True)
-    do_kripp = st.checkbox("Krippendorff's α 포함", value=True)
-    do_mcnemar = st.checkbox("McNemar (쌍 비교)", value=True)
-    do_auc = st.checkbox("AUC/정확도 비교 + DeLong", value=True)
-    do_logit = st.checkbox("불일치 위험요인(로지스틱)", value=True)
-    do_direct_kappa = st.checkbox("직접 Cohen weighted κ (AI_label/MDT_label/GL_label)", value=True)
-    export_all_zip = st.checkbox("모든 산출물 ZIP 묶음 제공", value=True)
+    do_icc    = st.checkbox("ICC 포함", value=True, key="chk_icc", help=GLOSSARY["ICC(2,k)"])
+    do_fleiss = st.checkbox("Fleiss' κ 포함", value=True, key="chk_fleiss", help=GLOSSARY["Fleiss' κ (unweighted)"])
+    do_kripp  = st.checkbox("Krippendorff's α 포함", value=True, key="chk_kripp", help=GLOSSARY["Krippendorff's α (ordinal)"])
+    do_mcnemar= st.checkbox("McNemar (쌍 비교)", value=True, key="chk_mcnemar", help=GLOSSARY["McNemar"])
+    do_auc    = st.checkbox("AUC/정확도 비교 + DeLong", value=True, key="chk_auc", help=f"{GLOSSARY['AUC']} {GLOSSARY['DeLong']}")
+    do_logit  = st.checkbox("불일치 위험요인(로지스틱)", value=True, key="chk_logit", help=GLOSSARY["Firth logistic"])
+    do_direct_kappa = st.checkbox("직접 Cohen weighted κ (AI_label/MDT_label/GL_label)", value=True, key="chk_direct")
+    export_all_zip  = st.checkbox("모든 산출물 ZIP 묶음 제공", value=True, key="chk_zip")
     st.divider()
-    run_all = st.button("🚀 한 번에 전체 실행", type="primary", use_container_width=True)
+    run_all = st.button("🚀 한 번에 전체 실행", type="primary", use_container_width=True, key="btn_runall")
 
+# ---------------- Load data ----------------
 if up is None:
     st.info("엑셀을 업로드하세요. 또는 샘플 템플릿을 사용하세요.")
     st.stop()
 
 df = read_excel(up)
-if df is None: st.stop()
+if df is None:
+    st.stop()
 st.success(f"Loaded: {df.shape[0]} rows × {df.shape[1]} cols")
+
+with st.expander("데이터 미리보기", expanded=False):
+    st.dataframe(df.head(), use_container_width=True)
 
 # ---------------- Column mapping ----------------
 with st.expander("열 선택 — 평가자 수 자유", expanded=True):
     cols = df.columns.tolist()
-    case_id_col = st.selectbox("Case ID 열", options=cols, index=cols.index("case_id") if "case_id" in cols else 0)
+    case_id_col = st.selectbox("Case ID 열", options=cols, index=cols.index("case_id") if "case_id" in cols else 0, key="sel_caseid")
     st.markdown("**AI vs MDT**")
-    am_cols = st.multiselect("평가자 열(2개 이상)", options=cols, default=[c for c in cols if c.startswith("A_M_")])
+    am_cols = st.multiselect("평가자 열(2개 이상) — AI vs MDT", options=cols, default=[c for c in cols if c.startswith("A_M_")], key="ms_am")
     st.markdown("**AI vs Guideline**")
-    ag_cols = st.multiselect("평가자 열(2개 이상)", options=cols, default=[c for c in cols if c.startswith("A_G_")])
+    ag_cols = st.multiselect("평가자 열(2개 이상) — AI vs Guideline", options=cols, default=[c for c in cols if c.startswith("A_G_")], key="ms_ag")
     st.markdown("**MDT vs Guideline**")
-    mg_cols = st.multiselect("평가자 열(2개 이상)", options=cols, default=[c for c in cols if c.startswith("M_G_")])
+    mg_cols = st.multiselect("평가자 열(2개 이상) — MDT vs Guideline", options=cols, default=[c for c in cols if c.startswith("M_G_")], key="ms_mg")
 
 for c in am_cols+ag_cols+mg_cols:
     if c in df.columns: df[c]=safe_num(df[c])
@@ -505,61 +586,68 @@ if weight_scheme=="custom CSV" and up_csv is not None:
         st.error(f"가중행렬 CSV 오류: {e}")
         W_custom = None
 
-results_tables = {}
-consensus_map = {}
-images_store = {}
-files_ready = {}
-
+# ---------------- Run all ----------------
 if run_all:
-    pairs = {"AI_vs_MDT": am_cols, "AI_vs_Guideline": ag_cols, "MDT_vs_Guideline": mg_cols}
-    for name, cols_list in pairs.items():
-        st.header(f"{name}")
-        if len(cols_list)<2:
-            st.warning(f"{name}: 평가자 열을 2개 이상 선택하세요.")
-            continue
-        R = df[cols_list].copy()
-        labels = sorted([v for v in pd.unique(R.values.ravel()) if pd.notna(v)]) or [1,2,3,4,5]
-        if W_custom is not None and W_custom.shape != (len(labels),len(labels)):
-            st.error(f"{name}: 커스텀 가중행렬 크기 {W_custom.shape} 이 라벨 수 k={len(labels)}와 일치하지 않습니다. 기본 {weight_scheme if weight_scheme!='custom CSV' else 'quadratic'} 사용")
-            D_use = None
-        else:
-            D_use = W_custom
-        pair_tab, summary, consensus, labels_used, D_used, rat_stats = summarize_pair(name, R, weight_scheme, D_use, int(B), int(seed), kripp_level=kripp_level)
+    with st.spinner("분석을 실행 중입니다..."):
+        # 매 실행마다 결과 초기화(세션 상태에 저장)
+        st.session_state.results_tables = {}
+        st.session_state.consensus_map = {}
+        st.session_state.images_store = {}
 
-        if not do_icc:
-            summary = summary[summary["Metric"]!="ICC(2,k)"]
-        if not do_fleiss:
-            summary = summary[summary["Metric"]!="Fleiss' κ (unweighted)"]
-        if not do_kripp:
-            summary = summary[~summary["Metric"].str.startswith("Krippendorff")]
+        pairs = {"AI_vs_MDT": am_cols, "AI_vs_Guideline": ag_cols, "MDT_vs_Guideline": mg_cols}
+        for name, cols_list in pairs.items():
+            st.header(f"{name}")
+            if len(cols_list)<2:
+                st.warning(f"{name}: 평가자 열을 2개 이상 선택하세요.")
+                continue
+            R = df[cols_list].copy()
+            labels = sorted([v for v in pd.unique(R.values.ravel()) if pd.notna(v)]) or [1,2,3,4,5]
+            if W_custom is not None and W_custom.shape != (len(labels),len(labels)):
+                st.error(f"{name}: 커스텀 가중행렬 크기 {W_custom.shape} 이 라벨 수 k={len(labels)}와 일치하지 않습니다. 기본 {weight_scheme if weight_scheme!='custom CSV' else 'quadratic'} 사용")
+                D_use = None
+            else:
+                D_use = W_custom
+            pair_tab, summary, consensus, labels_used, D_used, rat_stats = summarize_pair(name, R, weight_scheme, D_use, int(B), int(seed), kripp_level=kripp_level)
 
-        st.subheader("쌍별 가중 κ (+Holm 보정)")
-        st.dataframe(pair_tab, use_container_width=True)
-        st.subheader("요약 지표")
-        st.dataframe(summary, use_container_width=True)
-        st.subheader("평가자별 통계 (평균 κ, 결측률)")
-        st.dataframe(rat_stats, use_container_width=True)
+            if not do_icc:
+                summary = summary[summary["Metric"]!="ICC(2,k)"]
+            if not do_fleiss:
+                summary = summary[summary["Metric"]!="Fleiss' κ (unweighted)"]
+            if not do_kripp:
+                summary = summary[~summary["Metric"].str.startswith("Krippendorff")]
 
-        results_tables[f"{name}_pairwise_kappa"]=pair_tab
-        results_tables[f"{name}_summary"]=summary
-        results_tables[f"{name}_per_rater"]=rat_stats
-        consensus_map[name]=consensus
+            tab1, tab2, tab3, tab4 = st.tabs(["쌍별 가중 κ", "요약 지표", "평가자별 통계", "시각화"])
+            with tab1:
+                st.subheader("쌍별 가중 κ (+Holm 보정)")
+                st.dataframe(pair_tab, use_container_width=True)
+            with tab2:
+                st.subheader("요약 지표")
+                st.dataframe(summary, use_container_width=True)
+            with tab3:
+                st.subheader("평가자별 통계 (평균 κ, 결측률)")
+                st.dataframe(rat_stats, use_container_width=True)
 
-        if HAS_PLOTLY:
-            fig=px.histogram(consensus.dropna(), nbins=len(labels_used)*2, title=f"{name} consensus histogram")
-            fig.update_layout(showlegend=False); st.plotly_chart(fig, use_container_width=True)
-            try:
-                bio=BytesIO(); fig.write_image(bio, format="png"); bio.seek(0); images_store[f"{name}_consensus_hist.png"]=bio.getvalue()
-            except Exception as e:
-                st.info(f"히스토그램 이미지 저장 실패: {e}")
-            # heatmap
-            fig_h, K, raters = kappa_heatmap(R, labels_used, D_used if D_use is not None else make_distance_matrix(len(labels_used), weight_scheme), f"{name} pairwise weighted κ heatmap")
-            if fig_h is not None:
-                st.plotly_chart(fig_h, use_container_width=True)
-                try:
-                    bio=BytesIO(); fig_h.write_image(bio, format="png"); bio.seek(0); images_store[f"{name}_kappa_heatmap.png"]=bio.getvalue()
-                except Exception as e:
-                    st.info(f"히트맵 이미지 저장 실패: {e}")
+            st.session_state.results_tables[f"{name}_pairwise_kappa"]=pair_tab
+            st.session_state.results_tables[f"{name}_summary"]=summary
+            st.session_state.results_tables[f"{name}_per_rater"]=rat_stats
+            st.session_state.consensus_map[name]=consensus
+
+            if HAS_PLOTLY:
+                with tab4:
+                    st.subheader("합의 점수 분포")
+                    fig_hist=px.histogram(consensus.dropna(), nbins=max(10, len(labels_used)*2), title=f"{name} consensus histogram")
+                    fig_hist.update_layout(showlegend=False); st.plotly_chart(fig_hist, use_container_width=True)
+                    try:
+                        bio=BytesIO(); fig_hist.write_image(bio, format="png"); bio.seek(0); st.session_state.images_store[f"{name}_consensus_hist.png"]=bio.getvalue()
+                    except Exception: pass
+
+                    st.subheader("쌍별 κ 히트맵")
+                    fig_h, K, raters = kappa_heatmap(R, labels_used, D_used if D_use is not None else make_distance_matrix(len(labels_used), weight_scheme), f"{name} pairwise weighted κ heatmap")
+                    if fig_h is not None:
+                        st.plotly_chart(fig_h, use_container_width=True)
+                        try:
+                            bio=BytesIO(); fig_h.write_image(bio, format="png"); bio.seek(0); st.session_state.images_store[f"{name}_kappa_heatmap.png"]=bio.getvalue()
+                        except Exception: pass
 
     # Direct Cohen weighted κ for raw labels
     if do_direct_kappa and all(c in df.columns for c in ["AI_label","MDT_label","GL_label"]):
@@ -568,47 +656,47 @@ if run_all:
         D = W_custom if (W_custom is not None and W_custom.shape==(len(labels),len(labels))) else make_distance_matrix(len(labels), weight_scheme if weight_scheme!="custom CSV" else "quadratic")
         co_tab = []
         for (a,b,name2) in [("AI_label","MDT_label","AI_vs_MDT_raw"),
-                           ("AI_label","GL_label","AI_vs_GL_raw"),
-                           ("MDT_label","GL_label","MDT_vs_GL_raw")]:
+                             ("AI_label","GL_label","AI_vs_GL_raw"),
+                             ("MDT_label","GL_label","MDT_vs_GL_raw")]:
             k0 = weighted_kappa_custom(df[a], df[b], labels, D)
             def stat(idx): return weighted_kappa_custom(df[a].iloc[idx], df[b].iloc[idx], labels, D)
-            lo,hi,p,boots = bootstrap_ci_stat(stat, len(df), B=int(B), seed=int(seed))
+            lo,hi,p,_ = bootstrap_ci_stat(stat, len(df), B=int(B), seed=int(seed))
             co_tab.append({"Pair":name2,"Weighted Kappa":round(k0,4),"95% CI Lower":round(lo,4),"95% CI Upper":round(hi,4),"P (bootstrap)":round(p,6),"Interp":interpret_kappa(k0)})
         co_df = pd.DataFrame(co_tab)
         st.dataframe(co_df, use_container_width=True)
-        results_tables["Direct_Cohen_weighted_kappa"]=co_df
+        st.session_state.results_tables["Direct_Cohen_weighted_kappa"]=co_df
 
     # ------------- McNemar & AUC -------------
     if do_mcnemar or do_auc:
         st.header("성능 비교 (McNemar, AUC/정확도, DeLong)")
-        all_keys = list(consensus_map.keys())
+        all_keys = list(st.session_state.consensus_map.keys())
         if len(all_keys)>=2:
             left_key = st.selectbox("예측1", all_keys, index=0, key="pred1_key")
             right_key = st.selectbox("예측2", all_keys, index=1, key="pred2_key")
             thr1 = st.number_input(f"{left_key} 양성 임계(≥)", value=4, min_value=1, max_value=5, step=1, key="thr1")
             thr2 = st.number_input(f"{right_key} 양성 임계(≥)", value=4, min_value=1, max_value=5, step=1, key="thr2")
-            bin1 = (consensus_map[left_key] >= thr1).astype(float)
-            bin2 = (consensus_map[right_key] >= thr2).astype(float)
+            bin1 = (st.session_state.consensus_map[left_key] >= thr1).astype(float)
+            bin2 = (st.session_state.consensus_map[right_key] >= thr2).astype(float)
             v = ~(bin1.isna() | bin2.isna())
             tab = pd.crosstab(bin1[v], bin2[v])
             st.dataframe(tab, use_container_width=True)
-            results_tables["McNemar_table"]=tab.reset_index()
+            st.session_state.results_tables["McNemar_table"]=tab.reset_index()
             if do_mcnemar and tab.shape==(2,2):
                 try:
-                    res = sm_mcnemar(tab, exact=True)
+                    res = sm_mcnemar(tab.to_numpy(), exact=True)
                     st.write(f"**McNemar exact p**: {res.pvalue:.6f}")
-                    results_tables["McNemar_p"]=pd.DataFrame({"p_exact":[res.pvalue]})
+                    st.session_state.results_tables["McNemar_p"]=pd.DataFrame({"p_exact":[res.pvalue]})
                 except Exception as e:
                     st.error(f"McNemar 오류: {e}")
 
             if do_auc:
                 ref_key = st.selectbox("Reference(이진)로 사용할 쌍", all_keys, index=0, key="ref_key_auc")
                 thr_ref = st.number_input(f"{ref_key} 기준 임계(≥)", value=4, min_value=1, max_value=5, step=1, key="thr_ref")
-                y_true = (consensus_map[ref_key] >= thr_ref).astype(int)
+                y_true = (st.session_state.consensus_map[ref_key] >= thr_ref).astype(int)
                 pred_keys = st.multiselect("예측자로 비교할 쌍(점수)", all_keys, default=[k for k in all_keys if k!=ref_key], key="pred_keys_auc")
-                rows=[]; ref_for_delong=None
+                rows=[]; ref_for_delong=None; scores_for_roc = {}; aucs_for_roc = {}
                 for pk in pred_keys:
-                    score = (consensus_map[pk] - consensus_map[pk].min()) / max(1e-9, (consensus_map[pk].max()-consensus_map[pk].min()))
+                    score = (st.session_state.consensus_map[pk] - st.session_state.consensus_map[pk].min()) / max(1e-9, (st.session_state.consensus_map[pk].max()-st.session_state.consensus_map[pk].min()))
                     idx = y_true.dropna().index.intersection(score.dropna().index)
                     if len(idx)==0:
                         rows.append({"Predictor":pk,"AUC":np.nan,"AUC_CI_lo":np.nan,"AUC_CI_hi":np.nan,"DeLong_p":np.nan,
@@ -617,6 +705,7 @@ if run_all:
                     yt = y_true.loc[idx]; ys = score.loc[idx]
                     auc = roc_auc_score(yt, ys)
                     lo, hi, _ = bootstrap_metric_ci(yt, ys, lambda u,v: roc_auc_score(u,v), B=int(B), seed=int(seed))
+                    scores_for_roc[pk] = ys; aucs_for_roc[pk] = auc
                     if ref_for_delong is None:
                         ref_for_delong = ys; delong_p = np.nan
                     else:
@@ -625,46 +714,63 @@ if run_all:
                         except Exception:
                             delong_p = np.nan
                     cutoff = st.number_input(f"{pk} 이진화 임계(정확도)", value=4, min_value=1, max_value=5, step=1, key=f"cut_{pk}")
-                    acc = float(( (consensus_map[pk].loc[idx] >= cutoff).astype(float) == yt ).mean())
-                    lo_a, hi_a, _ = bootstrap_metric_ci(yt, (consensus_map[pk].loc[idx] >= cutoff).astype(float),
+                    acc = float(( (st.session_state.consensus_map[pk].loc[idx] >= cutoff).astype(float) == yt ).mean())
+                    lo_a, hi_a, _ = bootstrap_metric_ci(yt, (st.session_state.consensus_map[pk].loc[idx] >= cutoff).astype(float),
                                                         lambda u,v: float((u==v).mean()), B=int(B), seed=int(seed))
                     rows.append({"Predictor":pk,"AUC":round(auc,4),"AUC_CI_lo":round(lo,4),"AUC_CI_hi":round(hi,4),
                                  "DeLong_p": None if np.isnan(delong_p) else round(delong_p,6),
                                  "Accuracy":round(acc,4),"Acc_CI_lo":round(lo_a,4),"Acc_CI_hi":round(hi_a,4)})
                 perf_df = pd.DataFrame(rows)
                 st.dataframe(perf_df, use_container_width=True)
-                results_tables["Performance"]=perf_df
+                st.session_state.results_tables["Performance"]=perf_df
+                if scores_for_roc and HAS_PLOTLY:
+                    fig_roc = plot_roc_curves(y_true, scores_for_roc, aucs_for_roc)
+                    st.plotly_chart(fig_roc, use_container_width=True)
+                    try:
+                        bio = BytesIO(); fig_roc.write_image(bio, format="png"); bio.seek(0)
+                        st.session_state.images_store["ROC_comparison.png"] = bio.getvalue()
+                    except Exception: pass
 
     # ------------- Logistic risk factors -------------
     if do_logit:
         st.header("불일치 위험요인 (로지스틱)")
-        model_pairs = st.multiselect("회귀분석을 수행할 비교쌍 선택", list(consensus_map.keys()), default=list(consensus_map.keys()))
-        thr_discord = st.number_input("불일치 정의: 합의 점수 ≤", value=2, min_value=1, max_value=5, step=1)
+        model_pairs = st.multiselect("회귀분석을 수행할 비교쌍 선택", list(st.session_state.consensus_map.keys()), default=list(st.session_state.consensus_map.keys()), key="ms_models")
+        thr_discord = st.number_input("불일치 정의: 합의 점수 ≤", value=2, min_value=1, max_value=5, step=1, key="num_thr_discord", help="합의 중앙값이 임계 이하이면 불일치로 정의.")
         excluded = set([case_id_col]) | set(am_cols) | set(ag_cols) | set(mg_cols)
         candidates = [c for c in df.columns if c not in excluded]
         default_covars = [c for c in ["age","sex","ASA","ECOG","stage","T","N","PNI","EMVI","obstruction"] if c in candidates]
-        covars = st.multiselect("공변량 선택", options=candidates, default=default_covars)
-        robust = st.checkbox("Robust SE (HC3)", value=True)
-        penalty = st.selectbox("패널티(선택)", ["none","l2","l1"], index=0)
-        alpha = st.number_input("패널티 강도 alpha", value=1.0, min_value=0.0, step=0.1)
-        stepwise = st.checkbox("Stepwise (AIC) 사용 (패널티 미사용 시)", value=False)
-        use_firth = st.checkbox("Firth (분리/희귀사건 대비)", value=False)
+        covars = st.multiselect("공변량 선택", options=candidates, default=default_covars, key="ms_covars")
+        robust = st.checkbox("Robust SE (HC3)", value=True, key="chk_robust", help="이분산·모형오류에 견고한 표준오차.")
+        penalty = st.selectbox("패널티(선택)", ["none","l2","l1"], index=0, key="sel_penalty", help="정규화 회귀(L2/L1). 샘플 대비 변수 많을 때 권장.")
+        alpha = st.number_input("패널티 강도 alpha", value=1.0, min_value=0.0, step=0.1, key="num_alpha")
+        stepwise = st.checkbox("Stepwise (AIC) 사용 (패널티 미사용 시)", value=False, key="chk_stepwise")
+        use_firth = st.checkbox("Firth (분리/희귀사건 대비)", value=False, key="chk_firth", help=GLOSSARY["Firth logistic"])
         for pair in model_pairs:
-            y = (consensus_map[pair] <= thr_discord).astype(int)
+            if pair not in st.session_state.consensus_map:
+                continue
+            y = (st.session_state.consensus_map[pair] <= thr_discord).astype(int)
             df["_discordant"] = y
             try:
                 pen = None if penalty=="none" else penalty
                 res, or_tab, vif_df = fit_logit(df, "_discordant", covars, robust=robust, penalty=pen, alpha=alpha, stepwise=stepwise, firth=use_firth)
                 st.subheader(f"{pair} — OR (discordance=1)")
-                st.dataframe(or_tab, use_container_width=True)
-                st.markdown("VIF")
-                st.dataframe(vif_df.sort_values("VIF", ascending=False), use_container_width=True)
-                results_tables[f"RiskFactors_{pair}"]=or_tab
-                results_tables[f"VIF_{pair}"]=vif_df
+                logit_tab1, logit_tab2 = st.tabs(["Odds Ratios", "VIF"])
+                with logit_tab1:
+                    st.dataframe(or_tab, use_container_width=True)
+                with logit_tab2:
+                    if HAS_VIF and not vif_df.empty:
+                        st.dataframe(vif_df.sort_values("VIF", ascending=False), use_container_width=True)
+                    elif not HAS_VIF:
+                        st.info("statsmodels의 VIF 모듈을 찾지 못했습니다. (선택 사항) `pip install -U statsmodels` 후 사용 가능합니다.")
+                    else:
+                        st.info("VIF를 계산할 변수가 2개 미만입니다.")
+                st.session_state.results_tables[f"RiskFactors_{pair}"]=or_tab
+                if not vif_df.empty:
+                    st.session_state.results_tables[f"VIF_{pair}"]=vif_df
                 try:
-                    results_tables[f"ModelSummary_{pair}"]=pd.DataFrame({"summary":[res.summary2().as_text()]})
+                    st.session_state.results_tables[f"ModelSummary_{pair}"]=pd.DataFrame({"summary":[res.summary2().as_text()]})
                 except Exception:
-                    results_tables[f"ModelSummary_{pair}"]=pd.DataFrame({"summary":[str(res)]})
+                    st.session_state.results_tables[f"ModelSummary_{pair}"]=pd.DataFrame({"summary":[str(res)]})
             except Exception as e:
                 st.error(f"{pair} 회귀 오류: {e}")
 
@@ -690,7 +796,7 @@ def build_pptx(tables: dict):
         from pptx import Presentation
         from pptx.util import Inches
     except Exception as e:
-        st.error(f"PPTX 라이브러리 오류: {e}"); return None
+        st.error(f"PPTX 라이브러리 오류: `pip install python-pptx` 필요. 오류: {e}"); return None
     prs = Presentation()
     slide = prs.slides.add_slide(prs.slide_layouts[0])
     slide.shapes.title.text = "CRC Agreement — Summary"; slide.placeholders[1].text = "Auto-generated report"
@@ -711,78 +817,100 @@ def build_docx(tables: dict):
     try:
         from docx import Document
     except Exception as e:
-        st.error(f"DOCX 라이브러리 오류: {e}"); return None
+        st.error(f"DOCX 라이브러리 오류: `pip install python-docx` 필요. 오류: {e}"); return None
     doc = Document(); doc.add_heading("CRC Agreement — Summary", 0)
     for name, d in tables.items():
         doc.add_heading(name, level=1)
         if isinstance(d, pd.DataFrame) and not d.empty:
             t = doc.add_table(rows=d.shape[0]+1, cols=d.shape[1])
+            t.style = 'Table Grid'
             for j,c in enumerate(d.columns): t.cell(0,j).text = str(c)
             for i in range(d.shape[0]):
                 for j in range(d.shape[1]):
+                    # ✨ 여기가 수정된 부분입니다 ✨
                     t.cell(i+1,j).text = str(d.iloc[i,j])
         else:
             doc.add_paragraph(str(d))
     bio=BytesIO(); doc.save(bio); bio.seek(0); return bio
 
 def build_tex(tables: dict):
-    def esc(s): return str(s).replace('_','\_').replace('%','\%').replace('&','\&').replace('#','\#')
-    lines=["\documentclass{article}","\usepackage{booktabs}","\usepackage[margin=1in]{geometry}","\begin{document}","\section*{CRC Agreement — Summary}"]
+    def esc(s):
+        return (str(s)
+                .replace('\\', r'\textbackslash{}')
+                .replace('_', r'\_')
+                .replace('%', r'\%')
+                .replace('&', r'\&')
+                .replace('#', r'\#'))
+    lines = [
+        r"\documentclass{article}",
+        r"\usepackage{booktabs}",
+        r"\usepackage[margin=1in]{geometry}",
+        r"\begin{document}",
+        r"\section*{CRC Agreement --- Summary}",
+    ]
     for name, d in tables.items():
-        lines.append(f"\subsection*{{{esc(name)}}}")
+        lines.append(r"\subsection*{" + esc(name) + r"}")
         if isinstance(d, pd.DataFrame) and not d.empty:
-            header=" & ".join(map(esc,d.columns)) + " \\ \toprule"
-            lines.append("\begin{tabular}{%s}" % ("l"*d.shape[1]))
-            lines.append("\toprule "+header)
+            lines.append(r"\begin{tabular}{" + ("l"*d.shape[1]) + r"}")
+            header = " & ".join(map(esc, d.columns)) + r" \\"
+            lines.append(r"\toprule")
+            lines.append(header)
+            lines.append(r"\midrule")
             for i in range(d.shape[0]):
-                row=" & ".join([esc(x) for x in d.iloc[i,:].tolist()]) + " \\ "
+                row = " & ".join([esc(x) for x in d.iloc[i,:].tolist()]) + r" \\"
                 lines.append(row)
-            lines.append("\bottomrule\end{tabular}")
+            lines.append(r"\bottomrule")
+            lines.append(r"\end{tabular}")
         else:
             lines.append(esc(d))
-    lines.append("\end{document}")
-    bio=BytesIO(); bio.write("\n".join(lines).encode("utf-8")); bio.seek(0); return bio
+    lines.append(r"\end{document}")
+    bio=BytesIO(); bio.write(("\n".join(lines)).encode("utf-8")); bio.seek(0); return bio
 
 def pack_all_zip(tables: dict, images: dict):
-    from zipfile import ZipFile, ZIP_DEFLATED
     zbio = BytesIO()
     with ZipFile(zbio, "w", ZIP_DEFLATED) as z:
-        # tables as Excel, pptx, docx, tex
         xls = to_excel(tables); z.writestr("results.xlsx", xls.getvalue())
-        pptx = build_pptx(tables); 
+        pptx = build_pptx(tables)
         if pptx is not None: z.writestr("report.pptx", pptx.getvalue())
-        docx = build_docx(tables); 
+        docx = build_docx(tables)
         if docx is not None: z.writestr("report.docx", docx.getvalue())
         tex = build_tex(tables); z.writestr("report.tex", tex.getvalue())
-        # images
         for name, data in images.items():
             z.writestr(f"figures/{name}", data)
-        # json dump
         try:
             j = {k: (v.to_dict(orient="list") if isinstance(v, pd.DataFrame) else str(v)) for k,v in tables.items()}
-            z.writestr("results.json", json.dumps(j).encode("utf-8"))
+            z.writestr("results.json", json.dumps(j, indent=2).encode("utf-8"))
         except Exception:
             pass
     zbio.seek(0); return zbio
 
+# --- 안전하게 세션에서 읽기 ---
+results_tables = st.session_state.get("results_tables", {})
+images_store  = st.session_state.get("images_store", {})
+
 if results_tables:
     xls = to_excel(results_tables)
     st.download_button("통합 결과 Excel (results.xlsx)", data=xls, file_name="results.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                      mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_xlsx")
     pptx = build_pptx(results_tables)
     if pptx is not None:
         st.download_button("PPTX 보고서", data=pptx, file_name="report.pptx",
-                           mime="application/vnd.openxmlformats-officedocument.presentationml.presentation")
+                          mime="application/vnd.openxmlformats-officedocument.presentationml.presentation", key="dl_pptx")
     docx = build_docx(results_tables)
     if docx is not None:
         st.download_button("DOCX 보고서", data=docx, file_name="report.docx",
-                           mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+                          mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", key="dl_docx")
     tex = build_tex(results_tables)
-    st.download_button("LaTeX (.tex)", data=tex, file_name="report.tex", mime="application/x-tex")
+    st.download_button("LaTeX (.tex)", data=tex, file_name="report.tex", mime="application/x-tex", key="dl_tex")
     if export_all_zip:
         allzip = pack_all_zip(results_tables, images_store)
-        st.download_button("📦 모든 산출물 ZIP (results_all.zip)", data=allzip, file_name="results_all.zip", mime="application/zip")
+        st.download_button("📦 모든 산출물 ZIP (results_all.zip)", data=allzip, file_name="results_all.zip", mime="application/zip", key="dl_zip")
 else:
     st.info("아직 결과가 없습니다. 사이드바의 '한 번에 전체 실행'을 눌러주세요.")
+
+# ---------------- Glossary section ----------------
+with st.expander("ℹ️ 용어 설명(간단)"):
+    for k, v in GLOSSARY.items():
+        st.markdown(f"- **{k}**: {v}")
 
 st.caption("© 2025 — CRC Agreement Analyzer — MAX")
