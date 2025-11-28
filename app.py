@@ -106,6 +106,12 @@ def _signup(email: str, password: str):
 
 def _render_auth_sidebar():
     st.sidebar.header("계정")
+    if st.sidebar.button("데모 계정으로 바로 체험", help="로그인 없이 샘플 데이터까지 자동 불러오기"):
+        st.session_state.logged_in = True
+        st.session_state.username = "demo@example.com"
+        st.session_state.df_rec, st.session_state.df_conc = _create_sample_data()
+        st.session_state.success_message = "데모 계정으로 로그인하고 샘플 데이터를 불러왔습니다."
+
     tab_login, tab_signup = st.sidebar.tabs(["로그인", "회원가입"])
 
     with tab_login:
