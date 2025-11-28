@@ -27,6 +27,27 @@ pip install -r requirements.txt
 3. 직접 데이터를 쓰려면 사이드바에서 **엑셀 템플릿 다운로드** 후 데이터를 채워 업로드하거나, "데모 데이터 불러오기" 버튼으로 즉시 테스트합니다.
 4. 업로드/데모 데이터가 준비되면 메인 화면에서 일치율, 신뢰도, 불일치 사유, 시각화를 바로 확인하고 CSV/PNG로 다운로드할 수 있습니다.
 
+### GitHub에서 최신 버전으로 업데이트하기
+
+이미 클론해 둔 저장소에서 최신 변경 사항을 반영하려면 아래 순서로 진행합니다.
+
+1. 저장소 루트로 이동합니다.
+   ```bash
+   cd /path/to/agrrement-discordance
+   ```
+2. 원격 저장소에서 최신 커밋을 가져옵니다.
+   ```bash
+   git pull origin main
+   ```
+3. 의존성이 바뀌었을 수 있으니 필요하면 다시 설치합니다.
+   ```bash
+   pip install -r requirements.txt
+   ```
+4. 새 버전으로 Streamlit 앱을 실행합니다.
+   ```bash
+   streamlit run app.py
+   ```
+
 ### CLI (automatic batch analysis)
 
 If you have a completed Excel file that follows the template structure, you can run the
