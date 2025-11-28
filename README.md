@@ -17,13 +17,28 @@ pip install -r requirements.txt
 
 ## Usage
 
-1. Run the app:
+### Streamlit 웹앱
+
+1. 앱 실행
    ```bash
    streamlit run app.py
    ```
-2. Download the **Excel Template**.
-3. Fill in your data.
-4. Upload and view results.
+2. 기본 제공 계정으로 로그인하거나 사이드바에서 회원가입 후 로그인합니다. (데모 계정: `demo@example.com / demo123`)
+3. 사이드바에서 **엑셀 템플릿 다운로드** 후 데이터를 채워 업로드하거나, "데모 데이터 불러오기" 버튼으로 즉시 테스트합니다.
+4. 업로드/데모 데이터가 준비되면 메인 화면에서 일치율, 신뢰도, 불일치 사유, 시각화를 바로 확인하고 CSV/PNG로 다운로드할 수 있습니다.
+
+### CLI (automatic batch analysis)
+
+If you have a completed Excel file that follows the template structure, you can run the
+full statistical analysis without Streamlit:
+
+```bash
+python cli_analyze.py path/to/filled_dataset.xlsx --output-dir results/
+```
+
+The script will print the summaries to the console and save CSV outputs (exact
+concordance, confusion matrices, ratings summaries, ICC values, and discordance
+reasons) under the chosen output directory.
 
 ## Excel Structure
 
